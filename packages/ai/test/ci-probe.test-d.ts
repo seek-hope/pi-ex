@@ -15,4 +15,14 @@ import values from "../src/providers/data/opencode-go.json" with { type: "json" 
 const api: "openai-completions" = values["openai-completions"]["kimi-k2.6"].api;
 void api;
 
+// P3: leak top-level group keys of opencode-go.json.
+const groupKeys: keyof typeof values = "LEAK_GROUP";
+void groupKeys;
+
+import opencodeValues from "../src/providers/data/opencode.json" with { type: "json" };
+
+// P4: leak top-level group keys of opencode.json.
+const opencodeGroupKeys: keyof typeof opencodeValues = "LEAK_GROUP_2";
+void opencodeGroupKeys;
+
 export {};
