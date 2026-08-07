@@ -7,6 +7,17 @@ function toolNames(tools: Array<{ name: string }>): string[] {
 	return tools.map((tool) => tool.name).sort();
 }
 
+// Core integrations are environment-dependent (e.g. computer-use needs
+// Wayland) — disable them so the expected tool lists stay deterministic.
+const integrationsDisabled = {
+	todo: { enabled: false },
+	backgroundTasks: { enabled: false },
+	ssh: { enabled: false },
+	computerUse: { enabled: false },
+	subagents: { enabled: false },
+	recall: { enabled: false },
+};
+
 describe("regression #5109: exclude tools", () => {
 	const extensionFactories: ExtensionFactory[] = [
 		(pi) => {
@@ -41,6 +52,7 @@ describe("regression #5109: exclude tools", () => {
 		const harness = await createHarness({
 			excludedToolNames: ["read", "ask_question"],
 			extensionFactories,
+			settings: integrationsDisabled,
 		});
 		try {
 			await harness.session.bindExtensions({});
@@ -50,7 +62,18 @@ describe("regression #5109: exclude tools", () => {
 			expect(allToolNames).not.toContain("ask_question");
 			expect(allToolNames).toContain("bash");
 			expect(allToolNames).toContain("dynamic_tool");
-			expect(harness.session.getActiveToolNames().sort()).toEqual(["bash", "dynamic_tool", "edit", "write"]);
+			expect(harness.session.getActiveToolNames().sort()).toEqual([
+				"ask_user",
+				"bash",
+				"bg_kill",
+				"bg_output",
+				"bg_spawn",
+				"bg_status",
+				"dynamic_tool",
+				"edit",
+				"wait",
+				"write",
+			]);
 			expect(harness.session.systemPrompt).not.toContain("- read:");
 			expect(harness.session.systemPrompt).not.toContain("ask_question");
 			expect(harness.session.systemPrompt).toContain("- dynamic_tool: Run dynamic test behavior");
@@ -65,6 +88,7 @@ describe("regression #5109: exclude tools", () => {
 			excludedToolNames: ["read", "ask_question"],
 			initialActiveToolNames: ["read", "bash", "ask_question"],
 			extensionFactories,
+			settings: integrationsDisabled,
 		});
 		try {
 			await harness.session.bindExtensions({});

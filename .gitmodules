@@ -1,0 +1,3 @@
+[submodule ".pi/extensions"]
+	path = .pi/extensions
+	url = https://github.com/seek-hope/pi-extensions.git

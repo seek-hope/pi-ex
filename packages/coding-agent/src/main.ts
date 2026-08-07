@@ -575,6 +575,9 @@ export async function main(args: string[], options?: MainOptions) {
 		process.env.PI_SKIP_VERSION_CHECK = "1";
 	}
 
+	// pi-ex: skip npm version check — updated via git rebase, not npm
+	process.env.PI_SKIP_VERSION_CHECK = "1";
+
 	if (await runAuthCommand(args)) {
 		return;
 	}

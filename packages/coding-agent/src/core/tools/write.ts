@@ -1,11 +1,13 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Container, Text } from "@earendil-works/pi-tui";
-import { mkdir as fsMkdir, writeFile as fsWriteFile } from "fs/promises";
+import { mkdir as fsMkdir, readFile as fsReadFile, stat as fsStat, writeFile as fsWriteFile } from "fs/promises";
 import { dirname } from "path";
 import { type Static, Type } from "typebox";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.ts";
 import { getLanguageFromPath, highlightCode, type Theme } from "../../modes/interactive/theme/theme.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
+import type { FileContextTracker } from "../file-context.ts";
+import { formatFileTime } from "../file-context.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import { resolveToCwd } from "./path-utils.ts";
 import { normalizeDisplayText, renderToolPath, replaceTabs, str } from "./render-utils.ts";
@@ -32,16 +34,21 @@ export interface WriteOperations {
 	writeFile: (absolutePath: string, content: string) => Promise<void>;
 	/** Create directory recursively */
 	mkdir: (dir: string) => Promise<void>;
+	/** Read a file (used for stale-context detection before overwrite). Optional: staleness checks are skipped without it. */
+	readFile?: (absolutePath: string) => Promise<Buffer>;
 }
 
 const defaultWriteOperations: WriteOperations = {
 	writeFile: (path, content) => fsWriteFile(path, content, "utf-8"),
 	mkdir: (dir) => fsMkdir(dir, { recursive: true }).then(() => {}),
+	readFile: (path) => fsReadFile(path),
 };
 
 export interface WriteToolOptions {
 	/** Custom operations for file writing. Default: local filesystem */
 	operations?: WriteOperations;
+	/** Tracks file context currency for stale-edit detection. */
+	tracker?: FileContextTracker;
 }
 
 type WriteHighlightCache = {
@@ -188,6 +195,7 @@ export function createWriteToolDefinition(
 	options?: WriteToolOptions,
 ): ToolDefinition<typeof writeSchema, undefined> {
 	const ops = options?.operations ?? defaultWriteOperations;
+	const tracker = options?.tracker;
 	return {
 		name: "write",
 		label: "write",
@@ -219,12 +227,48 @@ export function createWriteToolDefinition(
 				await ops.mkdir(dir);
 				throwIfAborted();
 
+				// Stale-context guard: if the file exists on disk and the model's
+				// tracked view of it is outdated, refuse to silently clobber the
+				// external changes (mirrors the edit tool's freshness check).
+				if (tracker && ops.readFile) {
+					try {
+						const diskContent = (await ops.readFile(absolutePath)).toString("utf-8");
+						if (tracker.check(absolutePath, diskContent) === "outdated") {
+							const shortPath = path.includes("/") ? path : absolutePath.split("/").slice(-2).join("/");
+							throw new Error(
+								`[write] Your context for ${shortPath} is outdated. ` +
+									`The file changed since you last read or edited it. ` +
+									`Use read() to get the current content, then retry the write.`,
+							);
+						}
+					} catch (err) {
+						// ENOENT means the file doesn't exist yet — a fresh write is fine.
+						if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+					}
+				}
+				throwIfAborted();
+
 				// Write the file contents.
 				await ops.writeFile(absolutePath, content);
 				throwIfAborted();
 
+				// Attach the new file's last-modified time so the model can compare
+				// timestamps across read results and detect external changes.
+				let statMtime: number | undefined;
+				try {
+					statMtime = (await fsStat(absolutePath)).mtimeMs;
+				} catch {
+					/* stat failure is not fatal — skip the note */
+				}
+				tracker?.markWritten(absolutePath, content, statMtime);
+
 				return {
-					content: [{ type: "text", text: `Successfully wrote ${content.length} bytes to ${path}` }],
+					content: [
+						{
+							type: "text",
+							text: `Successfully wrote ${content.length} bytes to ${path}${statMtime !== undefined ? ` (modified ${formatFileTime(statMtime)})` : ""}`,
+						},
+					],
 					details: undefined,
 				};
 			});

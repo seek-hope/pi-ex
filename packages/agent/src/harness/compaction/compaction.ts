@@ -33,6 +33,9 @@ export interface CompactionDetails {
 	/** Files modified in the compacted history. */
 	modifiedFiles: string[];
 }
+/** Fraction of reserveTokens budgeted for the summary output. */
+const OUTPUT_TOKEN_RESERVE_RATIO = 0.8;
+
 function safeJsonStringify(value: unknown): string {
 	try {
 		return JSON.stringify(value) ?? "undefined";
@@ -152,6 +155,8 @@ export interface CompactionSettings {
 	reserveTokens: number;
 	/** Approximate recent-context tokens to keep after compaction. */
 	keepRecentTokens: number;
+	/** Compact when context usage exceeds this fraction of the context window. */
+	thresholdRatio?: number;
 }
 
 /** Default compaction settings used by the harness. */
@@ -159,6 +164,7 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
+	thresholdRatio: 0.9,
 };
 
 /** Calculate total context tokens from provider usage. */
@@ -246,7 +252,9 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 /** Return whether context usage exceeds the configured compaction threshold. */
 export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
 	if (!settings.enabled) return false;
-	return contextTokens > contextWindow - settings.reserveTokens;
+	// Compact when context usage exceeds the configured fraction (default 90%)
+	// of the model's context window.
+	return contextTokens > contextWindow * (settings.thresholdRatio ?? 0.9);
 }
 
 const ESTIMATED_IMAGE_CHARS = 4800;
@@ -539,7 +547,7 @@ export async function generateSummaryWithUsage(
 	callbacks?: RetryCallbacks,
 ): Promise<Result<{ text: string; usage: Usage }, CompactionError>> {
 	const maxTokens = Math.min(
-		Math.floor(0.8 * reserveTokens),
+		Math.floor(OUTPUT_TOKEN_RESERVE_RATIO * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	);
 	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;

@@ -23,8 +23,83 @@
 
 - Softened the bash tool's `PI_*` environment guideline in an attempt to reduce unnecessary inspection commands ([#7128](https://github.com/earendil-works/pi/issues/7128)).
 - Reduced worst-case automatic terminal theme detection delay from 200 ms to 100 ms by probing color-scheme and background support concurrently.
+- Integration follow-up messages (bg completion, ssh completion, wait
+  wake-ups) now split on the agent's real loop state (`agent.isActive`)
+  instead of the session flag, which stays set during post-run
+  compaction/retry. A completion arriving in that window used to be
+  queued and stranded until the next user input; now it is delivered
+  immediately, and any messages that still end up stranded are replayed
+  when the session settles. An arriving follow-up also cancels a pending
+  wait timer, so a background completion no longer produces a redundant
+  wake-up later.
+- Wake-up and completion messages guide autonomous work: the wait wake-up
+  says to wait again while tasks are still running, and bg/ssh completion
+  notices say to keep going through the remaining steps instead of
+  reporting early. The ask/wait guidance block documents the autonomous
+  work loop (start → wait → check → continue → report when done).
+- ssh_exec now runs every command under nohup on the remote and waits
+  synchronously for up to the timeout window (default 120s, unchanged);
+  commands still running after the window are handed to the background
+  poller, so their completion notice wakes the session — simple commands
+  behave exactly as before, long commands can no longer bypass the
+  notification machinery with a manual `nohup ... &`.
+- The bash gate now auto-converts sleep commands instead of only pointing at
+  bg_spawn: a pure `sleep N` (with sudo/env/path prefixes, GNU suffixes,
+  fractional values, and summed multi-arguments) becomes a wait — the turn
+  ends and resumes after the sleep, clamped to the session wait cap with a
+  notice when exceeded. Sleeps inside longer commands, `while/until` polling
+  loops, and `watch` run the whole command as one background task via
+  bg_spawn, with the usual task id/notification flow. Unparseable sleeps
+  (variables, substitutions) keep the plain gate response.
+- Background tasks now allow sleeps up to 12h (previously 5 minutes) and the
+  default task timeout is 12h (previously 1h), matching the wait tool's
+  interactive cap. Background tasks can no longer be disabled in settings;
+  the bash gate depends on them.
+- Uncertainty entries the model review cannot confirm (malformed ruling,
+  missing ruling, or a failed review call) are now dropped instead of staying
+  pending for the user: the details a user actually cares about are easy to
+  reason about, while the hard-to-judge entries are exactly the low-value
+  trivia that should not survive in memory.
 
 ### Fixed
+
+- SSH security and lifecycle hardening: shellExec timeout errors no longer
+  leak the plaintext sudo password into model-visible output; remote
+  background task commands are no longer persisted in plaintext; changing a
+  sudo password actually resets the remote shell's cached copy (the
+  connections lookup used the session-scoped key and never matched); closing
+  or pruning a connection now drops its sudo passwords and stops its task
+  pollers silently instead of emitting a spurious "lost connection" notice.
+- Uncertainty review robustness: content-dedup asks before deleting a
+  user-ruled (verified/corrected) entry; a failed review call
+  (timeout/network) keeps entries for the next pass instead of dropping
+  them; uncertainty snapshots are pruned after 10 appends instead of
+  accumulating one full copy per flag forever; a corrupt latest snapshot no
+  longer hides an earlier valid one during restore.
+- Background-task lifecycle: bg_output//fg probing a just-finished task now
+  settles it fully (persist + notify + completion follow-up + prune) instead
+  of losing the wake-up; spawn dedup adoption registers the second session
+  for the completion notification and refreshes the label; task ids carry a
+  random suffix against millisecond collisions after a restart; timeout
+  kills emit a notification and follow-up instead of going unnoticed;
+  findOversizedSleep matches sleeps after one-line shell keywords
+  (`while c; do sleep N; done`); orphan recovery restores the original cwd
+  from the wrapper script; truncated completion output is annotated with
+  the log path.
+- The bash gate now splits segments on the single-`&` background operator,
+  closing a read-rule bypass (`foo & cat /etc/passwd`).
+- Sub-agent manager: sweep runs after restoreInterrupted (it was a
+  guaranteed no-op before); subagent_parallel waits for a free concurrency
+  slot (bounded) instead of dropping tasks when the pool is full;
+  resolveModel falls back to a bare-id search for catalog ids containing a
+  slash; merge-conflict results carry the stash warning.
+- The wait wake-up routes like the follow-up batcher (steer while the tool
+  loop is active) and is skipped when a completion notification is already
+  queued, removing the double wake-up race; file-context rotation no longer
+  re-notifies already-stale files on every mtime bump; post-edit-scan no
+  longer leaves dangling timer handles.
+
+### Fixed (upstream)
 
 - Fixed Bun standalone binaries crashing on startup when the cwd contains a `bunfig.toml` with `preload` by compiling with `--no-compile-autoload-bunfig` ([#7685](https://github.com/earendil-works/pi/pull/7685) by [@geril07](https://github.com/geril07)).
 - Fixed extension TUI method wrappers recursing indefinitely when delegating to the original method ([#7731](https://github.com/earendil-works/pi/issues/7731)).
@@ -121,6 +196,12 @@
 ### Added
 
 - Added built-in Baseten provider support with `BASETEN_API_KEY` authentication and `zai-org/GLM-5.2` as the default model.
+- Added the `ask_user` tool: when the model's analysis and reasoning cannot determine the user's intent, it asks the user (masked-free dialogs, one per question, all questions in one call answered consecutively) instead of guessing; headless sessions fail with guidance to proceed with a flagged assumption.
+- Added `bg_output` (tail a background task's log for the model) and `bg_kill` (stop a background task) tools; the running-tasks widget is now an interactive list (`/tasks` opens it — the default keybinding was dropped because ctrl+shift+t collides with common terminal shortcuts; arrows select, Enter views output, k kills, Esc back); `/fg <id>` shows the last 50 lines by default (`--full` for everything).
+- Added automatic background-task retention: finished tasks are pruned immediately — the completion notification carries the output, then the record, log, and scripts are deleted; only running tasks appear in lists and the widget.
+- Added local `sudo` password support for the bash tool: password-requiring sudo probes cached credentials (`sudo -n true`) first, then asks the **user** through a masked dialog (memory-only, never persisted, never in the model context) and injects it via `SUDO_ASKPASS` + `sudo -A` with 0600 temp files deleted after use; headless sessions and sub-agent toolsets fail with a clear message.
+- Added the `wait` tool: the model suspends its turn after starting a long-running background task and resumes automatically when the wait completes, with fixed guidance plus the currently running background-task list; background-task completions still wake the agent earlier. Interactive sessions: up to 12h per wait. Headless sessions: up to 120s, 5 uses per session. Any new user input cancels a pending wait.
+- Added system-prompt guidance teaching the model when to ask (`ask_user`) versus proceed with an assumption, and to prefer `wait` over busy-waiting or polling loops.
 - Added experimental remote-session client APIs: the transport-neutral `PiClient`, CBOR protocol, Unix-socket transport, and `@earendil-works/pi-coding-agent/client` `RemoteSession` controller with transcript reducers. See [Pi Client](../client/README.md) and [Remote Protocol](../protocol/README.md) ([#7344](https://github.com/earendil-works/pi/pull/7344), [#7348](https://github.com/earendil-works/pi/pull/7348), [#7371](https://github.com/earendil-works/pi/pull/7371), [#7409](https://github.com/earendil-works/pi/pull/7409)).
 - Added `CredentialSynchronizationError` for credential changes that commit successfully but fail to synchronize local model state.
 - Added chainable `pi.registerMarkdownTransformer()` hooks for display-only transformation of user and assistant Markdown. See [`pi.registerMarkdownTransformer()`](docs/extensions.md#piregistermarkdowntransformertransformer) ([#7231](https://github.com/earendil-works/pi/pull/7231) by [@xl0](https://github.com/xl0)).
@@ -130,6 +211,15 @@
 - Added a draggable transcript scrollbar to fullscreen mode with configurable `auto`, `always`, and `hidden` modes through `/settings`; `always` reserves the rightmost column.
 - Added page scrolling and marked-message navigation shortcuts to fullscreen mode.
 - Added an optional `scrollbarThumb` theme color for fullscreen scrollbar thumbs, falling back to `selectedBg`.
+- Added a post-edit reference scan: after a successful edit, identifiers removed or changed by the edit are looked up through the registered codegraph tools (`codegraph_sync` + `codegraph_callers`) and the remaining call sites are appended to the edit result, so the model can sync them in the same turn. Best-effort with a 5s deadline — missing, slow, or failing scans never break the edit result. Controllable via `settings.codeScan.enabled` (default true).
+- Simplified the compaction review to a pure memory decision: category labels are gone and each statement is judged as ✓ keep — retain it in memory, or ✗ abandon — drop it; the uncertainty review no longer shows category tags either.
+- Added automatic uncertainty review (`compaction.uncertaintyReview.auto`, default on): the model settles pending flags itself, newest-first, against the latest conversation — triggered silently when a user message conflicts with a pending flag (checked before the model responds), and again at compaction. Failures degrade silently. The user popup is skipped in auto mode. `compaction.uncertaintyReview.auto: false` restores the manual review popup. User rulings are reviewed on an equal footing with model rulings — the intent-conflict check covers already-decided entries too — but overturning one requires an explicit confirmation popup (300s budget; timeout keeps the ruling).
+- Extended the automatic review to the compaction summary's uncertain sections (`Model Inferences` / `Open Questions` / `External State`): one batched model call judges the entries newest-first against the latest conversation and marks settled ones (`[REVIEWED — auto-verified]` / `[REVIEWED — auto-dismissed]`, or a corrected statement), so they no longer surface as unverified items after every compaction. Entries the call cannot settle stay in the user review flow; `compaction.uncertaintyReview.auto: false` keeps the previous behavior.
+- Reworked the compaction flag review into two layers: a content-level dedup pass (one batched call over all pending and decided flags, newest first — duplicate or contradicting entries are removed with the newest winning, and the model may rewrite a survivor to merge information) followed by the existing context review of the surviving pending flags. Dismissal is now physical everywhere: dismissed flags, superseded rulings, and dismissed summary entries are removed entirely (never stored as rulings or markers), keeping the compacted context clean; the same claim can be flagged again later.
+- Sub-agents now survive a crash/restart: each spawn writes `.pi/subagent/meta/<id>.json`, and a fresh manager re-registers crash survivors as `interrupted` (visible in subagent_list, reviewable/mergable/rejectable). The new `subagent_continue` tool resumes an interrupted sub-agent in its existing worktree with the original task re-issued plus a note to inspect the partial work; dismissals, merges, rejects, and stale worktrees clean up the metadata.
+- Renamed `/verify` to `/review` and made it a unified review entry point: un-reviewed compaction items (keep/abandon), then pending uncertainty flags, then a browsable list of decided entries.
+- Background tasks no longer show the command text in task lists, the running-tasks widget, `bg_status`, or completion notifications — `bg_spawn` takes an optional human-readable `label` (e.g. `npm run build`) shown instead; `/fg <id>` displays the full command plus current output. Status icons switched from emoji to text glyphs (✓/◐/✗).
+- Replaced truncation with automatic wrapping for user-facing lines in the session, user-message, and config selectors, review widgets, and tool-output hints; wrapped rows keep the selection visible via line-aware pagination.
 - Added configurable themed Unicode rendering for supported Mermaid diagrams in interactive messages, including optional rendering while streaming. See [Markdown settings](docs/settings.md#markdown) ([#7624](https://github.com/earendil-works/pi/pull/7624) by [@xl0](https://github.com/xl0)).
 - Added opt-in `Ctrl+P`/`Ctrl+N` prompt history navigation, with explicit history bindings taking precedence over application shortcuts while the editor is focused.
 - Added per-directory `AGENTS.override.md` context files, which replace `AGENTS.md` or `CLAUDE.md` in the same directory while preserving context from other directories. See [Context Files](docs/usage.md#context-files) ([#7681](https://github.com/earendil-works/pi/pull/7681) by [@Marvae](https://github.com/Marvae)).
@@ -273,6 +363,19 @@
 - Fixed explicitly configured Amazon Bedrock profiles being overridden by ambient AWS access keys. See [Amazon Bedrock](docs/providers.md#amazon-bedrock) ([#7176](https://github.com/earendil-works/pi/pull/7176) by [@christianbasch](https://github.com/christianbasch)).
 - Fixed inherited image fallback paths overflowing narrow terminals, shortened home-directory paths, and made absolute paths clickable when terminal hyperlinks are available ([#7262](https://github.com/earendil-works/pi/pull/7262)).
 - Fixed inherited OpenAI-compatible tool calls losing their function arguments when malformed deltas also contain an empty `custom` object ([#7288](https://github.com/earendil-works/pi/pull/7288) by [@sunnyyoung](https://github.com/sunnyyoung)).
+
+
+### Added
+
+- Added the todo flow as a core integration: the `todo_write` tool, an always-visible todo widget (full item content, no truncation), the `/todo` detail-view command, session persistence across resume/tree navigation, and a programmatic item API for other core modules. Disable via `"todo": { "enabled": false }` in settings.
+- Added `/btw <question>` as a built-in command: runs a temporary side query against the current model in-process (no subprocess, no session history, no cache writes) and shows the answer in a scrollable overlay. Disable via `"btw": { "enabled": false }` in settings.
+- Added background tasks as a core integration: tmux-based `bg_spawn`/`bg_status` tools, `/tasks`, `/fg <id>`, `/kill <id>`, and `/attach <id>` commands, a running-tasks widget, completion delivery as follow-up messages, and cross-session task recovery. Tasks survive session shutdown. Disable via `"backgroundTasks": { "enabled": false }` in settings.
+- Added persistent SSH as a core integration: `ssh_exec` (with `background` nohup mode and remote result delivery), `ssh_status`, `scp_to_remote`, and `scp_from_remote` tools, the `/ssh` command, and tool-call gating that blocks raw remote ssh/scp/rsync in bash and synchronous timeouts over 300s. Connections use shared ControlMaster sockets under `~/.ssh/pi-sockets`. Disable via `"ssh": { "enabled": false }` in settings.
+- Added computer use as a core integration (Hyprland/Wayland only): `computer_screenshot`, `computer_move`, `computer_click`, `computer_click_at`, `computer_double_click`, `computer_type`, `computer_key`, `computer_scroll`, `computer_drag`, `computer_get_position`, and `computer_get_screen_size` tools via grim/ydotool/wtype/hyprctl. Tools are hidden on unsupported platforms. Disable via `"computerUse": { "enabled": false }` in settings.
+- Added sub-agents as a core integration: `subagent_spawn`, `subagent_wait`, `subagent_review`, `subagent_merge`, `subagent_reject`, `subagent_parallel`, `subagent_list`, `subagent_cancel`, and `subagent_ensure_git` tools plus the `/subagent` command. Sub-agents run **in-process** on the shared model runtime (no subprocess, no re-auth) inside isolated git worktrees, auto-commit on completion, report back as follow-up messages, and integrate with the todo flow (live progress items). Recursive delegation up to `subagents.maxDepth` (default 5). Disable via `"subagents": { "enabled": false }` in settings.
+- Added structured compaction checkpoints (`compaction.quality: "structured"`, the default): compaction now produces a four-layer checkpoint — a Task Contract with explicit constraint lifecycle (active/superseded/unresolved with supersession chains, compiled from user messages only to avoid anchoring on the assistant's prior trajectory), a deterministic Action Ledger world state, an Execution State with unverified-inference and external-state markers, and verification notes from an audit pass. `"standard"` restores the legacy narrative summary; overflow recovery always falls back to it.
+- Added context pruning before compaction (`compaction.prune`): bulky old read-only tool outputs (read/bash/grep/find/ls) are replaced with stubs in the context view, often deferring compaction. Originals stay in the session archive. Tune via `compaction.prune.enabled`, `keepRecentToolResults`, `minPrunableTokens`, and `headChars`.
+- Added `recall` and `recall_checkpoints` tools: retrieve pre-compaction content from the session archive (which is never deleted) by keyword/regex, file path, or exact entry id. Disable via `"recall": { "enabled": false }` in settings.
 
 ## [0.82.1] - 2026-07-25
 

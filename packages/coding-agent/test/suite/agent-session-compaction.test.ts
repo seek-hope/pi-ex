@@ -200,7 +200,10 @@ describe("AgentSession compaction characterization", () => {
 	});
 
 	it("manually compacts with a custom streamFn when registry auth is absent", async () => {
-		const harness = await createHarness({ withConfiguredAuth: false });
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			settings: { compaction: { quality: "standard" } },
+		});
 		harnesses.push(harness);
 		seedCompactableSession(harness);
 		const getStreamCallCount = useSummaryStreamFn(harness, "summary from custom stream");
@@ -212,7 +215,10 @@ describe("AgentSession compaction characterization", () => {
 	});
 
 	it("manually compacts with provider-resolved bearer auth", async () => {
-		const harness = await createHarness({ withConfiguredAuth: false });
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			settings: { compaction: { quality: "standard" } },
+		});
 		harnesses.push(harness);
 		const model = harness.getModel();
 		harness.session.modelRuntime.registerNativeProvider({
@@ -263,7 +269,10 @@ describe("AgentSession compaction characterization", () => {
 	});
 
 	it("auto-compacts with a custom streamFn when registry auth is absent", async () => {
-		const harness = await createHarness({ withConfiguredAuth: false });
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			settings: { compaction: { quality: "standard" } },
+		});
 		harnesses.push(harness);
 		seedCompactableSession(harness);
 		const getStreamCallCount = useSummaryStreamFn(harness, "auto summary from custom stream");

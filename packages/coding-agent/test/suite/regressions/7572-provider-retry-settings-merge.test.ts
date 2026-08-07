@@ -8,7 +8,8 @@ describe("regression #7572: nested provider retry settings merge", () => {
 			JSON.stringify({
 				retry: {
 					provider: {
-						timeoutMs: 30000,
+						// External setting is in seconds; the getter converts to ms.
+						timeout: 30,
 						maxRetryDelayMs: 45000,
 					},
 				},

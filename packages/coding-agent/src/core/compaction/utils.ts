@@ -38,7 +38,9 @@ export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOp
 		const args = block.arguments as Record<string, unknown> | undefined;
 		if (!args) continue;
 
-		const path = typeof args.path === "string" ? args.path : undefined;
+		// The read tool accepts `file_path` as an alias for `path` — honor both.
+		const rawPath = args.path ?? args.file_path;
+		const path = typeof rawPath === "string" ? rawPath : undefined;
 		if (!path) continue;
 
 		switch (block.name) {
@@ -82,6 +84,37 @@ export function formatFileOperations(readFiles: string[], modifiedFiles: string[
 }
 
 // ============================================================================
+// Token Estimation
+// ============================================================================
+
+/**
+ * Rough token estimate for a text string, CJK-aware.
+ *
+ * The naive chars/4 heuristic underestimates CJK text 2-4x: CJK codepoints
+ * (and fullwidth forms) tokenize at roughly 1 token each, while other text
+ * averages ~4 chars per token. Single pass over UTF-16 code units (all CJK
+ * ranges below are in the BMP), no dependencies.
+ */
+export function estimateTextTokens(text: string): number {
+	let cjk = 0;
+	let other = 0;
+	for (let i = 0; i < text.length; i++) {
+		const code = text.charCodeAt(i);
+		if (
+			(code >= 0x4e00 && code <= 0x9fff) || // CJK Unified Ideographs
+			(code >= 0x3040 && code <= 0x30ff) || // Hiragana + Katakana
+			(code >= 0xac00 && code <= 0xd7af) || // Hangul Syllables
+			(code >= 0xff00 && code <= 0xffef) // Fullwidth ASCII / halfwidth forms
+		) {
+			cjk++;
+		} else {
+			other++;
+		}
+	}
+	return cjk + Math.ceil(other / 4);
+}
+
+// ============================================================================
 // Message Serialization
 // ============================================================================
 
@@ -106,7 +139,7 @@ function truncateForSummary(text: string, maxChars: number): string {
  * Tool results are truncated to keep the summarization request within
  * reasonable token budgets. Full content is not needed for summarization.
  */
-export function serializeConversation(messages: Message[]): string {
+export function serializeConversation(messages: Message[], toolResultMaxChars: number = TOOL_RESULT_MAX_CHARS): string {
 	const parts: string[] = [];
 
 	for (const msg of messages) {
@@ -141,7 +174,7 @@ export function serializeConversation(messages: Message[]): string {
 		} else if (msg.role === "toolResult") {
 			const content = contentText(msg.content, "");
 			if (content) {
-				parts.push(`[Tool result]: ${truncateForSummary(content, TOOL_RESULT_MAX_CHARS)}`);
+				parts.push(`[Tool result]: ${truncateForSummary(content, toolResultMaxChars)}`);
 			}
 		}
 	}

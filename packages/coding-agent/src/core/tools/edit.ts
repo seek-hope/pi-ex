@@ -1,11 +1,13 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { constants } from "fs";
-import { access as fsAccess, readFile as fsReadFile, writeFile as fsWriteFile } from "fs/promises";
+import { access as fsAccess, readFile as fsReadFile, stat as fsStat, writeFile as fsWriteFile } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { renderDiff } from "../../modes/interactive/components/diff.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
+import type { FileContextTracker } from "../file-context.ts";
+import { formatFileTime } from "../file-context.ts";
 import {
 	applyEditsToNormalizedContent,
 	computeEditsDiff,
@@ -59,6 +61,7 @@ export const editToolSystemPromptContribution = {
 		"When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
 		"Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
 		"Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
+		"The tool result may include a post-edit scan listing references that still use identifiers changed by this edit — update those call sites (e.g. with further edits) instead of ignoring them.",
 	],
 } as const;
 
@@ -99,6 +102,8 @@ const defaultEditOperations: EditOperations = {
 export interface EditToolOptions {
 	/** Custom operations for file editing. Default: local filesystem */
 	operations?: EditOperations;
+	/** Tracks file context currency for stale-edit detection. */
+	tracker?: FileContextTracker;
 }
 
 function prepareEditArguments(input: unknown): EditToolInput {
@@ -299,6 +304,7 @@ export function createEditToolDefinition(
 	options?: EditToolOptions,
 ): ToolDefinition<typeof editSchema, EditToolDetails | undefined, EditRenderState> {
 	const ops = options?.operations ?? defaultEditOperations;
+	const tracker = options?.tracker;
 	return {
 		name: "edit",
 		label: "edit",
@@ -338,7 +344,18 @@ export function createEditToolDefinition(
 				// Read the file.
 				const buffer = await ops.readFile(absolutePath);
 				const rawContent = buffer.toString("utf-8");
+
 				throwIfAborted();
+
+				// No stale-context guard here by design: if the file changed since
+				// the model last saw it, the region match below either fails
+				// ("oldText not found" error — the model re-reads) or succeeds
+				// (the external change didn't affect this edit).
+				// The write tool keeps its own guard because a write is a full
+				// overwrite with no region matching — it would silently clobber
+				// external changes. If the model's recorded view is stale we still
+				// annotate the result so it knows its memory is out of date.
+				const staleNote = tracker?.isOutdated(absolutePath, rawContent);
 
 				// Strip BOM before matching. The model will not include an invisible BOM in oldText.
 				const { bom, text: content } = stripBom(rawContent);
@@ -351,13 +368,29 @@ export function createEditToolDefinition(
 				await ops.writeFile(absolutePath, finalContent);
 				throwIfAborted();
 
+				// Attach the file's last-modified time so the model can compare
+				// timestamps across read results and detect external changes.
+				let statMtime: number | undefined;
+				try {
+					statMtime = (await fsStat(absolutePath)).mtimeMs;
+				} catch {
+					/* stat failure is not fatal — skip the note */
+				}
+				tracker?.markEdited(absolutePath, finalContent, statMtime);
+
 				const diffResult = generateDiffString(baseContent, newContent);
 				const patch = generateUnifiedPatch(path, baseContent, newContent);
+				let modifiedNote = "";
+				if (statMtime !== undefined) modifiedNote = ` (modified ${formatFileTime(statMtime)})`;
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Successfully replaced ${edits.length} block(s) in ${path}.`,
+							text:
+								`Successfully replaced ${edits.length} block(s) in ${path}.${modifiedNote}` +
+								(staleNote
+									? " This file changed since your last read; the edit applied to the current disk content."
+									: ""),
 						},
 					],
 					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },

@@ -9,8 +9,8 @@ import {
 	Spacer,
 	Text,
 	type TUI,
-	truncateToWidth,
 	visibleWidth,
+	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { ExtensionCommandContext } from "../../core/extensions/types.ts";
 import type { KeybindingsManager } from "../../core/keybindings.ts";
@@ -467,9 +467,16 @@ class LlamaView implements LlamaUi, Focusable {
 	}
 
 	render(width: number): string[] {
-		return this.content
-			.render(width)
-			.map((line) => (visibleWidth(line) > width ? truncateToWidth(line, width, "") : line));
+		const lines: string[] = [];
+		for (const line of this.content.render(width)) {
+			// Wrap overlong lines instead of truncating them.
+			if (visibleWidth(line) > width) {
+				lines.push(...wrapTextWithAnsi(line, width));
+			} else {
+				lines.push(line);
+			}
+		}
+		return lines;
 	}
 
 	invalidate(): void {

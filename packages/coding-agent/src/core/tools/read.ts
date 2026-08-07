@@ -3,7 +3,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { Api, ImageContent, Model, TextContent } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { constants } from "fs";
-import { access as fsAccess, readFile as fsReadFile } from "fs/promises";
+import { access as fsAccess, readFile as fsReadFile, stat as fsStat } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { getReadmePath } from "../../config.ts";
 import { keyHint, keyText } from "../../modes/interactive/components/keybinding-hints.ts";
@@ -12,6 +12,8 @@ import { processImage } from "../../utils/image-process.ts";
 import { detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
 import { formatPathRelativeToCwdOrAbsolute } from "../../utils/paths.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
+import type { FileContextTracker } from "../file-context.ts";
+import { formatFileTime } from "../file-context.ts";
 import { resolveReadPathAsync, resolveToCwd } from "./path-utils.ts";
 import { getTextOutput, renderToolPath, replaceTabs, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -65,6 +67,8 @@ export interface ReadToolOptions {
 	autoResizeImages?: boolean;
 	/** Custom operations for file reading. Default: local filesystem */
 	operations?: ReadOperations;
+	/** Tracks file context currency for stale-edit detection. */
+	tracker?: FileContextTracker;
 }
 
 type ReadRenderArgs = { path?: string; file_path?: string; offset?: number; limit?: number };
@@ -211,6 +215,7 @@ export function createReadToolDefinition(
 ): ToolDefinition<typeof readSchema, ReadToolDetails | undefined> {
 	const autoResizeImages = options?.autoResizeImages ?? true;
 	const ops = options?.operations ?? defaultReadOperations;
+	const tracker = options?.tracker;
 	return {
 		name: "read",
 		label: "read",
@@ -270,6 +275,22 @@ export function createReadToolDefinition(
 								// Read text content.
 								const buffer = await ops.readFile(absolutePath);
 								const textContent = buffer.toString("utf-8");
+								// Touch-time check: if the model had seen this file before and its
+								// recorded view no longer matches disk, the old view is void.
+								const staleNote = tracker?.isOutdated(absolutePath, textContent)
+									? "[file changed since your last read — any previously seen content is stale]"
+									: undefined;
+								// Attach the file's last-modified time as a metadata line so the
+								// model can compare read results and spot stale context itself.
+								let statMtime: number | undefined;
+								try {
+									statMtime = (await fsStat(absolutePath)).mtimeMs;
+								} catch {
+									/* stat failure is not fatal — skip the note */
+								}
+								tracker?.markRead(absolutePath, textContent, statMtime);
+								const modifiedNote =
+									statMtime !== undefined ? `[modified ${formatFileTime(statMtime)}]` : undefined;
 								const allLines = textContent.split("\n");
 								const totalFileLines = allLines.length;
 								// Apply offset if specified. Convert from 1-indexed input to 0-indexed array access.
@@ -317,6 +338,8 @@ export function createReadToolDefinition(
 									// No truncation and no remaining user-limited content.
 									outputText = truncation.content;
 								}
+								if (modifiedNote) outputText = `${modifiedNote}\n${outputText}`;
+								if (staleNote) outputText = `${staleNote}\n${outputText}`;
 								content = [{ type: "text", text: outputText }];
 							}
 

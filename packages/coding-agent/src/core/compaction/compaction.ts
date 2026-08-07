@@ -19,6 +19,7 @@ import {
 import {
 	computeFileLists,
 	createFileOps,
+	estimateTextTokens,
 	extractFileOpsFromMessage,
 	type FileOperations,
 	formatFileOperations,
@@ -31,9 +32,18 @@ import {
 // ============================================================================
 
 /** Details stored in CompactionEntry.details for file tracking */
+import type { TaskContract } from "./contract.ts";
+import type { ActionLedger } from "./ledger.ts";
+
 export interface CompactionDetails {
 	readFiles: string[];
 	modifiedFiles: string[];
+	/** Structured checkpoint (v2): the task contract at compaction time. */
+	contract?: TaskContract;
+	/** Structured checkpoint (v2): cumulative action ledger. */
+	ledger?: ActionLedger;
+	/** 2 for structured checkpoints, absent for legacy narrative summaries. */
+	version?: number;
 }
 
 /**
@@ -90,13 +100,19 @@ export interface CompactionResult<T = unknown> {
 	firstKeptEntryId: string;
 	tokensBefore: number;
 	estimatedTokensAfter?: number;
+	/** ID of the compaction entry appended to the session tree. */
+	compactionEntryId?: string;
 	/** Usage from the LLM call(s) that generated this summary, if available */
 	usage?: Usage;
 	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */
 	details?: T;
 }
 
-function combineUsage(first: Usage, second: Usage): Usage {
+/** Sum the usage of two LLM calls (e.g. the two passes of a split-turn compaction). */
+/** Fraction of reserveTokens budgeted for the summary output. */
+const OUTPUT_TOKEN_RESERVE_RATIO = 0.8;
+
+export function combineUsage(first: Usage, second: Usage): Usage {
 	return {
 		input: first.input + second.input,
 		output: first.output + second.output,
@@ -127,12 +143,15 @@ export interface CompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
 	keepRecentTokens: number;
+	/** Compact when context usage exceeds this fraction of the context window. */
+	thresholdRatio?: number;
 }
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
+	thresholdRatio: 0.9,
 };
 
 // ============================================================================
@@ -234,7 +253,9 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
  */
 export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
 	if (!settings.enabled) return false;
-	return contextTokens > contextWindow - settings.reserveTokens;
+	// Compact when context usage exceeds the configured fraction (default 90%)
+	// of the model's context window.
+	return contextTokens > contextWindow * (settings.thresholdRatio ?? 0.9);
 }
 
 // ============================================================================
@@ -242,63 +263,61 @@ export function shouldCompact(contextTokens: number, contextWindow: number, sett
 // ============================================================================
 
 const ESTIMATED_IMAGE_CHARS = 4800;
+/** Images have no text to scan; keep the legacy chars/4 estimate as tokens. */
+const ESTIMATED_IMAGE_TOKENS = ESTIMATED_IMAGE_CHARS / 4;
 
-function estimateTextAndImageContentChars(content: string | Array<{ type: string; text?: string }>): number {
+function estimateTextAndImageContentTokens(content: string | Array<{ type: string; text?: string }>): number {
 	if (typeof content === "string") {
-		return content.length;
+		return estimateTextTokens(content);
 	}
 
-	let chars = 0;
+	let tokens = 0;
 	for (const block of content) {
 		if (block.type === "text" && block.text) {
-			chars += block.text.length;
+			tokens += estimateTextTokens(block.text);
 		} else if (block.type === "image") {
-			chars += ESTIMATED_IMAGE_CHARS;
+			tokens += ESTIMATED_IMAGE_TOKENS;
 		}
 	}
-	return chars;
+	return tokens;
 }
 
 /**
- * Estimate token count for a message using chars/4 heuristic.
- * This is conservative (overestimates tokens).
+ * Estimate token count for a message.
+ * Uses a CJK-aware heuristic (CJK codepoints ~1 token each, other text
+ * ~4 chars per token) via {@link estimateTextTokens}.
  */
 export function estimateTokens(message: AgentMessage): number {
-	let chars = 0;
-
 	switch (message.role) {
 		case "user": {
-			chars = estimateTextAndImageContentChars(
+			return estimateTextAndImageContentTokens(
 				(message as { content: string | Array<{ type: string; text?: string }> }).content,
 			);
-			return Math.ceil(chars / 4);
 		}
 		case "assistant": {
 			const assistant = message as AssistantMessage;
+			let tokens = 0;
 			for (const block of assistant.content) {
 				if (block.type === "text") {
-					chars += block.text.length;
+					tokens += estimateTextTokens(block.text);
 				} else if (block.type === "thinking") {
-					chars += block.thinking.length;
+					tokens += estimateTextTokens(block.thinking);
 				} else if (block.type === "toolCall") {
-					chars += block.name.length + JSON.stringify(block.arguments).length;
+					tokens += estimateTextTokens(block.name) + estimateTextTokens(JSON.stringify(block.arguments));
 				}
 			}
-			return Math.ceil(chars / 4);
+			return tokens;
 		}
 		case "custom":
 		case "toolResult": {
-			chars = estimateTextAndImageContentChars(message.content);
-			return Math.ceil(chars / 4);
+			return estimateTextAndImageContentTokens(message.content);
 		}
 		case "bashExecution": {
-			chars = message.command.length + message.output.length;
-			return Math.ceil(chars / 4);
+			return estimateTextTokens(message.command) + estimateTextTokens(message.output);
 		}
 		case "branchSummary":
 		case "compactionSummary": {
-			chars = message.summary.length;
-			return Math.ceil(chars / 4);
+			return estimateTextTokens(message.summary);
 		}
 	}
 
@@ -634,8 +653,9 @@ export async function generateSummaryWithUsage(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 ): Promise<{ text: string; usage: Usage }> {
+	// Fraction of reserveTokens budgeted for the summary output.
 	const maxTokens = Math.min(
-		Math.floor(0.8 * reserveTokens),
+		Math.floor(OUTPUT_TOKEN_RESERVE_RATIO * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	);
 

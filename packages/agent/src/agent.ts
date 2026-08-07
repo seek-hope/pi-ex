@@ -315,6 +315,11 @@ export class Agent {
 		return this.activeRun?.abortController.signal;
 	}
 
+	/** True while an agent run (the tool loop) is actually active. */
+	get isActive(): boolean {
+		return this.activeRun !== undefined;
+	}
+
 	/** Abort the current run, if one is active. */
 	abort(): void {
 		this.activeRun?.abortController.abort();

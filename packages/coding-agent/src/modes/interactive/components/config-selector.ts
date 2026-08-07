@@ -13,12 +13,12 @@ import {
 	matchesKey,
 	Spacer,
 	truncateToWidth,
-	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { CONFIG_DIR_NAME } from "../../../config.ts";
 import type { PathMetadata, ResolvedPaths, ResolvedResource } from "../../../core/package-manager.ts";
 import type { PackageSource, SettingsManager } from "../../../core/settings-manager.ts";
 import { canonicalizePath, isLocalPath, resolvePath } from "../../../utils/paths.ts";
+import { pushWrapped } from "../../../utils/wrap-lines.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyHint, rawKeyHint } from "./keybinding-hints.ts";
@@ -205,17 +205,17 @@ class ConfigSelectorHeader implements Component {
 		const switchHint = this.projectModeAvailable ? keyHint("tui.input.tab", "switch mode") + sep : "";
 		const actionHint =
 			this.writeScope === "project" ? rawKeyHint("space", "cycle inherit/+/-") : rawKeyHint("space", "toggle");
-		const hint = switchHint + actionHint + sep + rawKeyHint("esc", "close");
-		const spacing = Math.max(1, width - visibleWidth(title) - visibleWidth(hint));
+		const hint = switchHint + actionHint + rawKeyHint("esc", "close");
 		const scopeHint =
 			this.writeScope === "project"
 				? theme.fg("muted", `${CONFIG_DIR_NAME}/settings.json · inherited global resources are dimmed`)
 				: theme.fg("muted", `~/${CONFIG_DIR_NAME}/agent/settings.json`);
 
-		return [
-			truncateToWidth(`${title}${" ".repeat(spacing)}${hint}`, width, ""),
-			truncateToWidth(scopeHint, width, ""),
-		];
+		// Wrap instead of truncating so hints are never cut off.
+		const lines: string[] = [];
+		pushWrapped(lines, `${title}${sep}${hint}`, width, 0);
+		pushWrapped(lines, scopeHint, width, 0);
+		return lines;
 	}
 }
 

@@ -21,6 +21,7 @@ export interface AppKeybindings {
 	"app.model.select": true;
 	"app.tools.expand": true;
 	"app.thinking.toggle": true;
+	"app.bg.tasks.manage": true;
 	"app.session.toggleNamedFilter": true;
 	"app.editor.external": true;
 	"app.message.copy": true;
@@ -87,6 +88,10 @@ export const KEYBINDINGS = {
 	"app.thinking.toggle": {
 		defaultKeys: "ctrl+t",
 		description: "Toggle thinking blocks",
+	},
+	"app.bg.tasks.manage": {
+		defaultKeys: [], // unbound by default — use /tasks (ctrl+shift+t collides with common terminal shortcuts)
+		description: "Toggle background task manager",
 	},
 	"app.session.toggleNamedFilter": {
 		defaultKeys: "ctrl+n",

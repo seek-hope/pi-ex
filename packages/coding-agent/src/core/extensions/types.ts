@@ -72,12 +72,6 @@ import type {
 	BashToolDetails,
 	BashToolInput,
 	EditToolInput,
-	FindToolDetails,
-	FindToolInput,
-	GrepToolDetails,
-	GrepToolInput,
-	LsToolDetails,
-	LsToolInput,
 	ReadToolDetails,
 	ReadToolInput,
 	WriteToolInput,
@@ -98,6 +92,8 @@ export interface ExtensionUIDialogOptions {
 	signal?: AbortSignal;
 	/** Timeout in milliseconds. Dialog auto-dismisses with live countdown display. */
 	timeout?: number;
+	/** Mask typed input (password entry). Only meaningful for input() dialogs. */
+	masked?: boolean;
 }
 
 /** Placement for extension widgets. */
@@ -875,21 +871,6 @@ export interface WriteToolCallEvent extends ToolCallEventBase {
 	input: WriteToolInput;
 }
 
-export interface GrepToolCallEvent extends ToolCallEventBase {
-	toolName: "grep";
-	input: GrepToolInput;
-}
-
-export interface FindToolCallEvent extends ToolCallEventBase {
-	toolName: "find";
-	input: FindToolInput;
-}
-
-export interface LsToolCallEvent extends ToolCallEventBase {
-	toolName: "ls";
-	input: LsToolInput;
-}
-
 export interface CustomToolCallEvent extends ToolCallEventBase {
 	toolName: string;
 	input: Record<string, unknown>;
@@ -906,9 +887,6 @@ export type ToolCallEvent =
 	| ReadToolCallEvent
 	| EditToolCallEvent
 	| WriteToolCallEvent
-	| GrepToolCallEvent
-	| FindToolCallEvent
-	| LsToolCallEvent
 	| CustomToolCallEvent;
 
 interface ToolResultEventBase {
@@ -943,17 +921,17 @@ export interface WriteToolResultEvent extends ToolResultEventBase {
 
 export interface GrepToolResultEvent extends ToolResultEventBase {
 	toolName: "grep";
-	details: GrepToolDetails | undefined;
+	details: ReadToolDetails | undefined;
 }
 
 export interface FindToolResultEvent extends ToolResultEventBase {
 	toolName: "find";
-	details: FindToolDetails | undefined;
+	details: EditToolDetails | undefined;
 }
 
 export interface LsToolResultEvent extends ToolResultEventBase {
 	toolName: "ls";
-	details: LsToolDetails | undefined;
+	details: BashToolDetails | undefined;
 }
 
 export interface CustomToolResultEvent extends ToolResultEventBase {
@@ -985,15 +963,6 @@ export function isEditToolResult(e: ToolResultEvent): e is EditToolResultEvent {
 export function isWriteToolResult(e: ToolResultEvent): e is WriteToolResultEvent {
 	return e.toolName === "write";
 }
-export function isGrepToolResult(e: ToolResultEvent): e is GrepToolResultEvent {
-	return e.toolName === "grep";
-}
-export function isFindToolResult(e: ToolResultEvent): e is FindToolResultEvent {
-	return e.toolName === "find";
-}
-export function isLsToolResult(e: ToolResultEvent): e is LsToolResultEvent {
-	return e.toolName === "ls";
-}
 
 /**
  * Type guard for narrowing ToolCallEvent by tool name.
@@ -1019,9 +988,6 @@ export function isToolCallEventType(toolName: "bash", event: ToolCallEvent): eve
 export function isToolCallEventType(toolName: "read", event: ToolCallEvent): event is ReadToolCallEvent;
 export function isToolCallEventType(toolName: "edit", event: ToolCallEvent): event is EditToolCallEvent;
 export function isToolCallEventType(toolName: "write", event: ToolCallEvent): event is WriteToolCallEvent;
-export function isToolCallEventType(toolName: "grep", event: ToolCallEvent): event is GrepToolCallEvent;
-export function isToolCallEventType(toolName: "find", event: ToolCallEvent): event is FindToolCallEvent;
-export function isToolCallEventType(toolName: "ls", event: ToolCallEvent): event is LsToolCallEvent;
 export function isToolCallEventType<TName extends string, TInput extends Record<string, unknown>>(
 	toolName: TName,
 	event: ToolCallEvent,

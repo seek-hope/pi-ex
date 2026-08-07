@@ -65,6 +65,8 @@ import {
 	computeCacheWaste,
 	detectCacheMiss,
 } from "../../core/cache-stats.ts";
+import { dismissItems, parseUncertainItems } from "../../core/compaction/review.ts";
+import type { UncertainFlag } from "../../core/compaction/uncertainty.ts";
 import type {
 	AutocompleteProviderFactory,
 	EditorFactory,
@@ -80,6 +82,10 @@ import type {
 } from "../../core/extensions/index.ts";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
+import type { BackgroundTasksIntegration } from "../../core/integrations/bg-tasks/index.ts";
+import type { SshIntegration } from "../../core/integrations/ssh/index.ts";
+import type { SubagentIntegration } from "../../core/integrations/subagent/index.ts";
+import type { TodoIntegration } from "../../core/integrations/todo/index.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
 import { createCompactionSummaryMessage } from "../../core/messages.ts";
 import {
@@ -112,8 +118,11 @@ import { checkForNewPiVersion, type LatestPiRelease } from "../../utils/version-
 import { ArminComponent } from "./components/armin.ts";
 import { AssistantMessageComponent } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
+import { BgTasksWidget } from "./components/bg-tasks-widget.ts";
 import { BorderedLoader } from "./components/bordered-loader.ts";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.ts";
+import { BtwScrollViewer } from "./components/btw-viewer.ts";
+import { CompactionReviewWidget } from "./components/compaction-review.ts";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.ts";
 import { CustomEditor } from "./components/custom-editor.ts";
 import { CustomEntryComponent } from "./components/custom-entry.ts";
@@ -149,6 +158,12 @@ import {
 import { ToolExecutionComponent } from "./components/tool-execution.ts";
 import { TreeSelectorComponent } from "./components/tree-selector.ts";
 import { TrustSelectorComponent } from "./components/trust-selector.ts";
+import {
+	type UncertaintyBrowseResult,
+	UncertaintyBrowseWidget,
+	type UncertaintyReviewResult,
+	UncertaintyReviewWidget,
+} from "./components/uncertainty-review.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.ts";
 import { editInExternalEditor } from "./external-editor.ts";
@@ -473,6 +488,8 @@ export class InteractiveMode {
 
 	// Messages queued while compaction is running
 	private compactionQueuedMessages: CompactionQueuedMessage[] = [];
+	// Pending post-compaction review (compactionEntryId, summary)
+	private pendingCompactionReview?: { entryId: string; summary: string };
 
 	// Shutdown state
 	private shutdownRequested = false;
@@ -1065,6 +1082,9 @@ export class InteractiveMode {
 		}
 
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
+
+		// Offer /review for an un-reviewed compaction from a previous run.
+		this.restorePendingCompactionReview(true);
 
 		// Process initial messages
 		if (initialMessage) {
@@ -2130,12 +2150,13 @@ export class InteractiveMode {
 
 		if (Array.isArray(content)) {
 			// Wrap string array in a Container with Text components
+			const maxLines = InteractiveMode.maxWidgetLines();
 			const container = new Container();
-			for (const line of content.slice(0, InteractiveMode.MAX_WIDGET_LINES)) {
+			for (const line of content.slice(0, maxLines)) {
 				container.addChild(new Text(line, 1, 0));
 			}
-			if (content.length > InteractiveMode.MAX_WIDGET_LINES) {
-				container.addChild(new Text(theme.fg("muted", "... (widget truncated)"), 1, 0));
+			if (content.length > maxLines) {
+				container.addChild(new Text(theme.fg("muted", `... (${content.length - maxLines} more lines)`), 1, 0));
 			}
 			component = container;
 		} else {
@@ -2193,8 +2214,15 @@ export class InteractiveMode {
 		this.setHiddenThinkingLabel();
 	}
 
-	// Maximum total widget lines to prevent viewport overflow
-	private static readonly MAX_WIDGET_LINES = 10;
+	/**
+	 * Maximum total widget lines, adaptive to terminal height: one third of
+	 * the screen, clamped to [10, 30]. A fixed cap of 10 was needlessly
+	 * truncating informational widgets (/todo, /tasks) on tall terminals.
+	 */
+	private static maxWidgetLines(): number {
+		const rows = process.stdout.rows ?? 24;
+		return Math.min(30, Math.max(10, Math.floor(rows / 3)));
+	}
 
 	/**
 	 * Render all extension widgets to the widget container.
@@ -2504,7 +2532,7 @@ export class InteractiveMode {
 					this.hideExtensionInput();
 					resolve(undefined);
 				},
-				{ tui: this.ui, timeout: opts?.timeout },
+				{ tui: this.ui, timeout: opts?.timeout, masked: opts?.masked },
 			);
 
 			this.disposeActiveSelector();
@@ -2764,6 +2792,8 @@ export class InteractiveMode {
 		// Set up handlers on defaultEditor - they use this.editor for text access
 		// so they work correctly regardless of which editor is active
 		this.defaultEditor.onEscape = () => {
+			// An open todo detail page closes on Esc (instead of paging /todo to the end).
+			if (this.session.getIntegration<TodoIntegration>("todo")?.closeDetailWidget()) return;
 			if (this.session.isStreaming) {
 				this.restoreQueuedMessagesToEditor({ abort: true });
 			} else if (this.session.isBashRunning) {
@@ -2804,6 +2834,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
+		this.defaultEditor.onAction("app.bg.tasks.manage", () => this.toggleBgTaskManager());
 		this.defaultEditor.onAction("app.editor.external", () => void this.handleOpenExternalEditor());
 		this.defaultEditor.onAction("app.message.copy", () => void this.handleCopyCommand({ flashConfirmation: true }));
 		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
@@ -2969,6 +3000,56 @@ export class InteractiveMode {
 				const customInstructions = text.startsWith("/compact ") ? text.slice(9).trim() : undefined;
 				this.editor.setText("");
 				await this.handleCompactCommand(customInstructions);
+				return;
+			}
+			if (text === "/todo") {
+				this.editor.setText("");
+				this.session.getIntegration<TodoIntegration>("todo")?.toggleDetailWidget();
+				return;
+			}
+			if (text === "/btw" || text.startsWith("/btw ")) {
+				this.editor.setText("");
+				await this.handleBtwCommand(text === "/btw" ? "" : text.slice(5).trim());
+				return;
+			}
+			if (text === "/review") {
+				this.editor.setText("");
+				await this.handleReviewCommand();
+				return;
+			}
+			if (text === "/tasks") {
+				this.editor.setText("");
+				this.toggleBgTaskManager();
+				return;
+			}
+			if (text === "/fg" || text.startsWith("/fg ")) {
+				this.editor.setText("");
+				await this.handleFgCommand(text === "/fg" ? "" : text.slice(4).trim());
+				return;
+			}
+			if (text === "/kill" || text.startsWith("/kill ")) {
+				this.editor.setText("");
+				await this.handleKillCommand(text === "/kill" ? "" : text.slice(6).trim());
+				return;
+			}
+			if (text === "/attach" || text.startsWith("/attach ")) {
+				this.editor.setText("");
+				await this.handleAttachCommand(text === "/attach" ? "" : text.slice(8).trim());
+				return;
+			}
+			if (text === "/ssh" || text.startsWith("/ssh ")) {
+				this.editor.setText("");
+				await this.handleSshCommand(text === "/ssh" ? "" : text.slice(5).trim());
+				return;
+			}
+			if (text === "/subagent") {
+				this.editor.setText("");
+				const subagent = this.session.getIntegration<SubagentIntegration>("subagent");
+				if (!subagent) {
+					this.showWarning('Sub-agents are disabled. Enable via "subagents": { "enabled": true }.');
+					return;
+				}
+				subagent.showStatusWidget();
 				return;
 			}
 			if (text === "/reload") {
@@ -3281,6 +3362,12 @@ export class InteractiveMode {
 
 			case "agent_settled":
 				await this.checkShutdownRequested();
+				await this.maybeShowUncertaintyReview();
+				break;
+
+			case "uncertainty_override_request":
+				// The auto-review wants to overturn a user ruling — confirm first.
+				await this.confirmUserRulingOverride(event.proposal);
 				break;
 
 			case "compaction_start": {
@@ -3323,6 +3410,16 @@ export class InteractiveMode {
 						),
 					);
 					this.footer.invalidate();
+
+					// Check for uncertain items the user should review.
+					const uncertain = parseUncertainItems(event.result.summary);
+					if (uncertain.length > 0 && event.result.compactionEntryId) {
+						this.pendingCompactionReview = {
+							entryId: event.result.compactionEntryId,
+							summary: event.result.summary,
+						};
+						this.showStatus(`Compaction complete. ${uncertain.length} unverified items — /review to inspect`);
+					}
 				} else if (event.errorMessage) {
 					if (event.reason === "manual") {
 						this.showError(event.errorMessage);
@@ -5138,6 +5235,7 @@ export class InteractiveMode {
 				return result;
 			}
 			this.showStatus("Resumed session");
+			this.restorePendingCompactionReview(true);
 			return result;
 		} catch (error: unknown) {
 			if (error instanceof MissingSessionCwdError) {
@@ -5155,6 +5253,7 @@ export class InteractiveMode {
 					return result;
 				}
 				this.showStatus("Resumed session in current cwd");
+				this.restorePendingCompactionReview(true);
 				return result;
 			}
 			return this.handleFatalRuntimeError("Failed to resume session", error);
@@ -5432,8 +5531,15 @@ export class InteractiveMode {
 				const defaultModelId = defaultModelPerProvider[providerId];
 				selectedModel = providerModels.find((model) => model.id === defaultModelId);
 				if (!selectedModel) {
-					selectionError = `${actionLabel}, but its default model "${defaultModelId}" is not available. Use /model to select a model.`;
-				} else {
+					// The catalog may have dropped the hardcoded default ID (models
+					// come and go). Fall back to the first available model instead of
+					// failing the selection.
+					selectedModel = providerModels[0];
+					this.showStatus(
+						`Default model "${defaultModelId}" is not in the ${providerId} catalog; selected ${selectedModel.id} instead.`,
+					);
+				}
+				if (selectedModel) {
 					try {
 						await this.session.setModel(selectedModel);
 					} catch (error: unknown) {
@@ -6085,6 +6191,490 @@ export class InteractiveMode {
 	 */
 	private getEditorKeyDisplay(action: Keybinding): string {
 		return keyDisplayText(action);
+	}
+
+	private bgTasks(): BackgroundTasksIntegration | undefined {
+		return this.session.getIntegration<BackgroundTasksIntegration>("bg-tasks");
+	}
+
+	/**
+	 * Restore a pending compaction review from the latest compaction entry.
+	 * The reviewed flag and dismissed markers are persisted in the session
+	 * file, so /review keeps working across restarts.
+	 */
+	private restorePendingCompactionReview(notify = false): void {
+		if (this.pendingCompactionReview) return;
+		const entry = this.sessionManager.getLatestCompactionEntry();
+		if (!entry) return;
+		const details = entry.details as Record<string, unknown> | undefined;
+		if (details?.reviewedAt) return;
+		const uncertain = parseUncertainItems(entry.summary);
+		if (uncertain.length === 0) return;
+		this.pendingCompactionReview = { entryId: entry.id, summary: entry.summary };
+		if (notify) {
+			this.showStatus(`Compaction review pending: ${uncertain.length} unverified items — /review to inspect`);
+		}
+	}
+
+	/** Guard against overlapping uncertainty review popups. */
+	private uncertaintyReviewOpen = false;
+
+	/**
+	 * Incremental uncertainty review: when the agent settles (run fully idle)
+	 * and the model flagged unverified claims, prompt the user immediately
+	 * instead of letting them pile up until post-compaction review.
+	 */
+	private async maybeShowUncertaintyReview(): Promise<void> {
+		if (this.uncertaintyReviewOpen) return;
+		// Auto-review mode: the model settles flags itself; no user popup.
+		if (this.settingsManager.getUncertaintyReviewAuto()) return;
+		if (this.settingsManager.getUncertaintyReviewTiming() !== "incremental") return;
+		const store = this.session.uncertaintyStore;
+		const pending = store.pending();
+		if (pending.length === 0) return;
+		this.uncertaintyReviewOpen = true;
+		try {
+			await this.showUncertaintyReview(pending);
+		} finally {
+			this.uncertaintyReviewOpen = false;
+		}
+	}
+
+	/**
+	 * Confirmation popup for the auto-review overturning a user ruling:
+	 * Enter accepts the change, Esc keeps the original ruling. The answer
+	 * is handed back through the session so the awaiting review pass can
+	 * continue (300s budget, timeout keeps the ruling).
+	 */
+	private async confirmUserRulingOverride(proposal: {
+		flagId: string;
+		claim: string;
+		decision: "verified" | "dismissed" | "corrected";
+		correction?: string;
+	}): Promise<void> {
+		let accepted = false;
+		let closed = false;
+		await this.showExtensionCustom<void>(
+			(_tui, componentTheme, _kb, done) => {
+				const A = (s: string) => componentTheme.fg("accent", componentTheme.bold(s));
+				const M = (s: string) => componentTheme.fg("dim", s);
+				const G = (s: string) => componentTheme.fg("success", s);
+				const H = (s: string) => componentTheme.fg("warning", s);
+				const close = (ok: boolean) => {
+					if (closed) return;
+					closed = true;
+					accepted = ok;
+					done();
+				};
+				const rulingLabel =
+					proposal.decision === "verified"
+						? "verified (keep)"
+						: proposal.decision === "dismissed"
+							? "dismissed (drop)"
+							: `corrected → ${proposal.correction ?? ""}`;
+				return {
+					render: () => [
+						"",
+						A(" Ruling Change"),
+						M(" The auto-review proposes to overturn a ruling you made earlier:"),
+						` ${proposal.claim}`,
+						` ${G("→")} ${rulingLabel}`,
+						"",
+						` ${G("Enter")} ${M("accept change")}  ${H("Esc")} ${M("keep original")}`,
+						"",
+					],
+					handleInput: (data: string) => {
+						if (data === "\r") {
+							close(true);
+							return false;
+						}
+						if (data === "\x1b") {
+							close(false);
+							return false;
+						}
+						return true;
+					},
+					invalidate: () => {},
+				};
+			},
+			{ overlay: true },
+		);
+		this.session.respondOverrideConfirmation(accepted);
+	}
+
+	/** Show the review popup for a batch of pending flags and apply the results. */
+	private async showUncertaintyReview(pending: UncertainFlag[]): Promise<void> {
+		const store = this.session.uncertaintyStore;
+		const max = this.settingsManager.getUncertaintyReviewMaxPerPrompt();
+		const batch = pending.slice(0, Math.max(1, max));
+		const widget = new UncertaintyReviewWidget(batch, pending.length - batch.length);
+		const result = await this.showExtensionCustom<UncertaintyReviewResult>(
+			(_tui, _componentTheme, _kb, done) => {
+				const control = widget.start(done);
+				return {
+					render: (w: number) => control.render(w),
+					handleInput: (data: string) => control.handleInput(data),
+					invalidate: () => control.invalidate(),
+				};
+			},
+			{ overlay: true },
+		);
+		const corrections: string[] = [];
+		let decidedCount = 0;
+		for (const [flagId, outcome] of result.decisions) {
+			if (store.decide(flagId, outcome.decision, outcome.correction)) {
+				decidedCount++;
+				if (outcome.decision === "corrected" && outcome.correction) {
+					const flag = batch.find((f) => f.id === flagId);
+					corrections.push(`- "${flag?.claim ?? flagId}" → 更正：${outcome.correction}`);
+				}
+			}
+		}
+		if (decidedCount > 0) {
+			const remaining = store.pending().length;
+			const suffix = remaining > 0 ? ` ${remaining} still pending.` : "";
+			this.showStatus(`Reviewed ${decidedCount} flagged claim(s).${suffix}`);
+		}
+		// Corrections steer the conversation back onto verified facts.
+		if (corrections.length > 0) {
+			await this.session.followUp(
+				`用户审核了你标记的不确定条目，以下更正立即生效：\n${corrections.join("\n")}\n请按更正后的事实继续。`,
+			);
+		}
+	}
+
+	/** /review: unified review — un-reviewed compaction items, then pending flags, then decided flags. */
+	private async handleReviewCommand(): Promise<void> {
+		// 1. Un-reviewed compaction items (keep/abandon).
+		if (await this.handleCompactionReviewCommand()) return;
+
+		// 2. Pending uncertainty flags.
+		const store = this.session.uncertaintyStore;
+		const pending = store.pending();
+		if (pending.length > 0) {
+			await this.showUncertaintyReview(pending);
+			return;
+		}
+		// 3. Browse already-decided flags.
+		const decided = store.decisions();
+		if (decided.length === 0) {
+			this.showStatus("No flagged uncertainty claims in this session.");
+			return;
+		}
+		const widget = new UncertaintyBrowseWidget(decided);
+		const result = await this.showExtensionCustom<UncertaintyBrowseResult>(
+			(_tui, _componentTheme, _kb, done) => {
+				const control = widget.start(done);
+				return {
+					render: (w: number) => control.render(w),
+					handleInput: (data: string) => control.handleInput(data),
+					invalidate: () => control.invalidate(),
+				};
+			},
+			{ overlay: true },
+		);
+		for (const flagId of result.requeue) {
+			store.requeue(flagId, "re-queued via /review");
+		}
+		const corrections: string[] = [];
+		for (const [flagId, outcome] of result.overrides) {
+			if (store.overrideDecision(flagId, outcome.decision, outcome.correction)) {
+				if (outcome.decision === "corrected" && outcome.correction) {
+					const flag = decided.find((f) => f.flagId === flagId);
+					corrections.push(`- "${flag?.claim ?? flagId}" → 更正：${outcome.correction}`);
+				}
+			}
+		}
+		if (result.requeue.length > 0) {
+			this.showStatus(`${result.requeue.length} item(s) re-queued for review.`);
+		}
+		if (corrections.length > 0) {
+			await this.session.followUp(
+				`用户更新了对不确定条目的审核结论，以下更正立即生效：\n${corrections.join("\n")}\n请按更正后的事实继续。`,
+			);
+		}
+	}
+
+	/** Compaction review (keep/abandon) for the pending un-reviewed summary. Returns true when handled. */
+	private async handleCompactionReviewCommand(): Promise<boolean> {
+		if (!this.pendingCompactionReview) {
+			// Lazy restore: covers session switches that bypassed the notify paths.
+			this.restorePendingCompactionReview();
+		}
+		if (!this.pendingCompactionReview) {
+			return false;
+		}
+
+		const { entryId, summary } = this.pendingCompactionReview;
+		const items = parseUncertainItems(summary);
+		if (items.length === 0) {
+			this.showStatus("No unverified items to review.");
+			this.session.sessionManager.markCompactionReviewed(entryId);
+			this.pendingCompactionReview = undefined;
+			return true;
+		}
+
+		const widget = new CompactionReviewWidget(items);
+		await this.showExtensionCustom<void>((_tui, _componentTheme, _kb, done) => {
+			const control = widget.start((result) => {
+				if (result.dismissedLines.size > 0) {
+					const newSummary = dismissItems(summary, result.dismissedLines);
+					this.session.sessionManager.updateCompactionSummary(entryId, newSummary);
+					this.showStatus(`Review complete. ${result.dismissedLines.size} item(s) dismissed.`);
+					// Rebuild chat to reflect updated summary.
+					this.chatContainer.clear();
+					this.rebuildChatFromMessages();
+				} else {
+					this.showStatus("Review complete. All items kept.");
+				}
+				// Persisted so the review is not offered again after a restart.
+				this.session.sessionManager.markCompactionReviewed(entryId);
+				this.pendingCompactionReview = undefined;
+				done();
+			});
+			return {
+				render: (w: number) => control.render(w),
+				handleInput: (data: string) => control.handleInput(data),
+				invalidate: () => control.invalidate(),
+			};
+		});
+		return true;
+	}
+
+	/**
+	 * Background-task manager widget: focusable list (↑↓ select, Enter view,
+	 * k kill, Esc back). Mounted by /tasks and removed when closed — it never
+	 * lingers on screen after Esc.
+	 */
+	private _bgTasksWidget: BgTasksWidget | undefined;
+
+	/** Remove the task-manager widget (and any preview) and return focus to the editor. */
+	private closeBgTaskManager(): void {
+		this.setExtensionWidget("bg-tasks", undefined);
+		this.setExtensionWidget("task-preview", undefined);
+		this._bgTasksWidget = undefined;
+		this.ui.setFocus(this.editor);
+	}
+
+	private toggleBgTaskManager(): void {
+		const bg = this.bgTasks();
+		if (!bg) {
+			this.showWarning('Background tasks are disabled. Enable via "backgroundTasks": { "enabled": true }.');
+			return;
+		}
+		const focused = this._bgTasksWidget?.focused === true;
+		if (focused || this._bgTasksWidget) {
+			this.closeBgTaskManager();
+			this.showStatus("Background task manager closed.");
+			return;
+		}
+		this._bgTasksWidget = new BgTasksWidget({
+			getTasks: () =>
+				[...bg.store.list()].sort((a, b) => {
+					const ar = a.status === "running" ? 1 : 0;
+					const br = b.status === "running" ? 1 : 0;
+					if (ar !== br) return br - ar;
+					return (b.startTime ?? 0) - (a.startTime ?? 0);
+				}),
+			onView: (id) => void this.showTaskPreview(id),
+			onBackFromView: () => this.setExtensionWidget("task-preview", undefined),
+			onKill: (id) => bg.killTask(id),
+			onExit: () => {
+				this.closeBgTaskManager();
+				this.showStatus("Background task manager closed.");
+			},
+			height: InteractiveMode.maxWidgetLines(),
+		});
+		this.setExtensionWidget("bg-tasks", () => this._bgTasksWidget!);
+		this.ui.setFocus(this._bgTasksWidget);
+		this._bgTasksWidget.refresh();
+		this.ui.requestRender();
+	}
+
+	/**
+	 * Preview panel for the task manager: the task's latest 5 output lines.
+	 * Dismissed by Esc (back to the task list) — never lingers.
+	 * Only running tasks are viewable; finished tasks were already delivered
+	 * with their completion notice and their records are reaped.
+	 */
+	private async showTaskPreview(id: string): Promise<void> {
+		const bg = this.bgTasks();
+		if (!bg) {
+			this.showWarning('Background tasks are disabled. Enable via "backgroundTasks": { "enabled": true }.');
+			return;
+		}
+		const task = bg.store.get(id);
+		if (!task) {
+			this.showError(`Task ${id} not found.`);
+			return;
+		}
+		if (task.status !== "running") {
+			this.showError(
+				`Task ${id} has finished (${task.status}) — its output was delivered with the completion notice.`,
+			);
+			return;
+		}
+		const result = await bg.taskOutput(id);
+		if (!result) {
+			this.showError(`Task ${id} not found.`);
+			return;
+		}
+		const { task: t, output } = result;
+		const lines = output.split("\n").slice(-5);
+		const maxLine = Math.max(this.ui.terminal.columns - 4, 20);
+		this.setExtensionWidget("task-preview", [
+			`┌─ ${id} [${t.status}]${t.exitCode != null ? ` exit=${t.exitCode}` : ""}`,
+			...(t.label ? [`│ ${t.label}`] : []),
+			...lines.map((l: string) => `│ ${l.substring(0, maxLine)}`),
+			`│ Esc back to tasks  |  /fg ${id} for full output`,
+			"└─",
+		]);
+	}
+
+	private async handleFgCommand(id: string): Promise<void> {
+		const bg = this.bgTasks();
+		if (!bg) {
+			this.showWarning('Background tasks are disabled. Enable via "backgroundTasks": { "enabled": true }.');
+			return;
+		}
+		const full = id.includes("--full");
+		id = id.replace(/\s*--full\s*/, "").trim();
+		if (!id) {
+			this.showWarning("Usage: /fg <task-id> [--full]");
+			return;
+		}
+		const task = bg.store.get(id);
+		if (!task) {
+			this.showError(`Task ${id} not found.`);
+			return;
+		}
+		if (task.status !== "running") {
+			this.showError(
+				`Task ${id} has finished (${task.status}) — its output was already delivered with the completion notice and the task record is reaped. Use /tasks for running tasks.`,
+			);
+			return;
+		}
+		const result = await bg.taskOutput(id);
+		if (!result) {
+			this.showError(`Task ${id} not found.`);
+			return;
+		}
+		const { task: t, output } = result;
+		const lines = output.split("\n");
+		const shown = full ? lines : lines.slice(-50);
+		const hidden = lines.length - shown.length;
+		const maxLine = Math.max(this.ui.terminal.columns - 4, 20);
+		this.setExtensionWidget(
+			`task-${id}`,
+			[
+				`┌─ ${id} [${t.status}]${t.exitCode != null ? ` exit=${t.exitCode}` : ""}`,
+				`│ $ ${t.description}`, // full command, never truncated
+				...(full ? shown.map((l: string) => `│ ${l}`) : shown.map((l: string) => `│ ${l.substring(0, maxLine)}`)),
+				!full && hidden > 0 ? `│ ... (${hidden} earlier lines hidden, use /fg ${id} --full)` : "",
+				`│ log: ${t.logFile}`,
+				"└─",
+			].filter(Boolean),
+		);
+	}
+
+	private async handleKillCommand(id: string): Promise<void> {
+		const bg = this.bgTasks();
+		if (!bg) {
+			this.showWarning('Background tasks are disabled. Enable via "backgroundTasks": { "enabled": true }.');
+			return;
+		}
+		if (!id) {
+			this.showWarning("Usage: /kill <task-id>");
+			return;
+		}
+		if (await bg.killTask(id)) {
+			this.showStatus(`Killed ${id}.`);
+		} else {
+			this.showError(`Task ${id} not found.`);
+		}
+	}
+
+	private async handleAttachCommand(id: string): Promise<void> {
+		const bg = this.bgTasks();
+		if (!bg) {
+			this.showWarning('Background tasks are disabled. Enable via "backgroundTasks": { "enabled": true }.');
+			return;
+		}
+		if (!id) {
+			this.showWarning("Usage: /attach <task-id>");
+			return;
+		}
+		const task = bg.store.get(id);
+		if (!task || task.status !== "running") {
+			this.showError(`Task ${id} is not running.`);
+			return;
+		}
+		this.ui.stop();
+		try {
+			await new Promise<void>((resolve) => {
+				const proc = spawn("tmux", ["attach-session", "-t", id], { stdio: "inherit" });
+				proc.on("exit", () => resolve());
+				proc.on("error", () => resolve());
+			});
+		} finally {
+			this.ui.start();
+			this.ui.requestRender(true);
+		}
+	}
+
+	private async handleSshCommand(args: string): Promise<void> {
+		const ssh = this.session.getIntegration<SshIntegration>("ssh");
+		if (!ssh) {
+			this.showWarning('SSH integration is disabled. Enable via "ssh": { "enabled": true }.');
+			return;
+		}
+		await ssh.handleCommand(args);
+	}
+
+	private async handleBtwCommand(question: string): Promise<void> {
+		if (!this.settingsManager.getBtwEnabled()) {
+			this.showWarning('/btw is disabled. Enable it via "btw": { "enabled": true } in settings.');
+			return;
+		}
+		if (!question) {
+			this.showWarning("Usage: /btw <your question>");
+			return;
+		}
+
+		const statusKey = "btw";
+		this.setExtensionStatus(statusKey, "by the way…");
+		let result: string;
+		try {
+			result = await this.session.runBtwQuery(question);
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+			return;
+		} finally {
+			this.setExtensionStatus(statusKey, undefined);
+		}
+
+		await this.showExtensionCustom<void>(
+			(tui, componentTheme, _kb, done) => {
+				const viewer = new BtwScrollViewer(result);
+				const container = new Container();
+				container.addChild(new DynamicBorder((s: string) => componentTheme.fg("accent", s)));
+				const title = question.length > 50 ? `${question.substring(0, 47)}...` : question;
+				container.addChild(new Text(componentTheme.fg("accent", componentTheme.bold(` /btw ${title}`)), 1, 0));
+				container.addChild(new Text("", 0, 0));
+				return {
+					render: (w: number) => [...container.render(w), ...viewer.render(w)],
+					invalidate: () => {
+						container.invalidate();
+						viewer.invalidate();
+					},
+					handleInput: (data: string) => {
+						if (!viewer.handleInput(data)) done();
+						tui.requestRender();
+					},
+				};
+			},
+			{ overlay: true },
+		);
 	}
 
 	private handleHotkeysCommand(): void {

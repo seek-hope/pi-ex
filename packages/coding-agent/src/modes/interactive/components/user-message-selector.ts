@@ -1,4 +1,4 @@
-import { type Component, Container, getKeybindings, Spacer, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { type Component, Container, getKeybindings, Spacer, Text, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 
@@ -39,34 +39,42 @@ class UserMessageList implements Component {
 		}
 
 		// Calculate visible range with scrolling
-		const startIndex = Math.max(
-			0,
-			Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), this.messages.length - this.maxVisible),
-		);
-		const endIndex = Math.min(startIndex + this.maxVisible, this.messages.length);
+		// Render every message block (message text wrapped + metadata + blank line)
+		const blocks: string[][] = [];
+		for (let i = 0; i < this.messages.length; i++) {
+			blocks.push(this.renderMessageBlock(i, width));
+		}
 
-		// Render visible messages (2 lines per message + blank line)
+		// Line-aware window containing the selection: messages may wrap to
+		// multiple lines, so paginate by total line count, not message count.
+		const heights = blocks.map((block) => block.length);
+		let startIndex = 0;
+		let endIndex = blocks.length;
+		if (heights.reduce((a, b) => a + b, 0) > this.maxVisible) {
+			let used = 0;
+			for (let i = 0; i < blocks.length; i++) {
+				const h = heights[i]!;
+				if (used + h > this.maxVisible) {
+					if (i > this.selectedIndex) break;
+					// Drop blocks from the top until this block fits (or it is the only block).
+					while (startIndex < i && used + h > this.maxVisible) {
+						used -= heights[startIndex]!;
+						startIndex++;
+					}
+				}
+				used += h;
+				endIndex = i + 1;
+			}
+			// Safety: the selection must be inside the window.
+			if (this.selectedIndex >= endIndex) {
+				startIndex = this.selectedIndex;
+				endIndex = this.selectedIndex + 1;
+			}
+		}
+
+		// Render visible message blocks
 		for (let i = startIndex; i < endIndex; i++) {
-			const message = this.messages[i];
-			const isSelected = i === this.selectedIndex;
-
-			// Normalize message to single line
-			const normalizedMessage = message.text.replace(/\n/g, " ").trim();
-
-			// First line: cursor + message
-			const cursor = isSelected ? theme.fg("accent", "› ") : "  ";
-			const maxMsgWidth = width - 2; // Account for cursor (2 chars)
-			const truncatedMsg = truncateToWidth(normalizedMessage, maxMsgWidth);
-			const messageLine = cursor + (isSelected ? theme.bold(truncatedMsg) : truncatedMsg);
-
-			lines.push(messageLine);
-
-			// Second line: metadata (position in history)
-			const position = i + 1;
-			const metadata = `  Message ${position} of ${this.messages.length}`;
-			const metadataLine = theme.fg("muted", metadata);
-			lines.push(metadataLine);
-			lines.push(""); // Blank line between messages
+			lines.push(...blocks[i]!);
 		}
 
 		// Add scroll indicator if needed
@@ -75,6 +83,35 @@ class UserMessageList implements Component {
 			lines.push(scrollInfo);
 		}
 
+		return lines;
+	}
+
+	/**
+	 * Render one message: the text wraps instead of truncating, followed by
+	 * metadata and a blank separator line.
+	 */
+	private renderMessageBlock(i: number, width: number): string[] {
+		const lines: string[] = [];
+		const message = this.messages[i];
+		const isSelected = i === this.selectedIndex;
+
+		// Normalize message to a single logical line
+		const normalizedMessage = message.text.replace(/\n/g, " ").trim();
+
+		// First line: cursor + message; continuations align under the message
+		const cursor = isSelected ? theme.fg("accent", "› ") : "  ";
+		const maxMsgWidth = Math.max(10, width - 2); // Account for cursor (2 chars)
+		const msgLines = wrapTextWithAnsi(normalizedMessage, maxMsgWidth);
+		for (let k = 0; k < msgLines.length; k++) {
+			const msgLine = msgLines[k]!;
+			lines.push((k === 0 ? cursor : "  ") + (isSelected ? theme.bold(msgLine) : msgLine));
+		}
+
+		// Metadata (position in history)
+		const position = i + 1;
+		const metadata = `  Message ${position} of ${this.messages.length}`;
+		lines.push(theme.fg("muted", metadata));
+		lines.push(""); // Blank line between messages
 		return lines;
 	}
 
