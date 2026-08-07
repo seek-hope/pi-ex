@@ -13,5 +13,6 @@ import values from "../src/providers/data/opencode-go.json" with { type: "json" 
 
 // P2: literal inference probe.
 const api: "openai-completions" = values["openai-completions"]["kimi-k2.6"].api;
+void api;
 
 export {};
