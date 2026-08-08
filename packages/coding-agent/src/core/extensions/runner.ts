@@ -547,6 +547,13 @@ export class ExtensionRunner {
 			this.staleMessage = message;
 			this.runtime.invalidate(message);
 		}
+		// UI resources registered through ctx.ui (setWidget/setHeader/setFooter/custom/onTerminalInput)
+		// are NOT disposed here. They live in the mode's TUI layer, which owns the actual components and
+		// their dispose() channels; the runner has no registry of them and no dispose hook to forward to.
+		// Disposal is handled by the interactive mode via resetExtensionUI(), which it hooks to the
+		// session invalidation callback (setBeforeSessionInvalidate). If you add UI-resource tracking
+		// to the runner in the future, dispose them here AND keep the mode's resetExtensionUI() as the
+		// authoritative teardown so no path double-disposes or misses a resource.
 	}
 
 	private assertActive(): void {
@@ -938,13 +945,24 @@ export class ExtensionRunner {
 			if (!handlers || handlers.length === 0) continue;
 
 			for (const handler of handlers) {
-				const handlerResult = await handler(event, ctx);
+				try {
+					const handlerResult = await handler(event, ctx);
 
-				if (handlerResult) {
-					result = handlerResult as ToolCallEventResult;
-					if (result.block) {
-						return result;
+					if (handlerResult) {
+						result = handlerResult as ToolCallEventResult;
+						if (result.block) {
+							return result;
+						}
 					}
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					const stack = err instanceof Error ? err.stack : undefined;
+					this.emitError({
+						extensionPath: ext.path,
+						event: "tool_call",
+						error: message,
+						stack,
+					});
 				}
 			}
 		}

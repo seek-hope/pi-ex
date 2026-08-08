@@ -521,59 +521,38 @@ interface ParsedModifyOtherKeysSequence {
 let _lastEventType: KeyEventType = "press";
 
 /**
- * Check if the last parsed key event was a key release.
+ * Check if the given input is a key release event.
  * Only meaningful when Kitty keyboard protocol with flag 2 is active.
+ *
+ * Uses the structured parse result (parseKittySequence's eventType) rather
+ * than substring matching — substring patterns like ":3u" can false-positive
+ * on ordinary text (e.g. "90:62:3F"). Input that cannot be structured-parsed
+ * as a Kitty release sequence is NOT treated as a release.
  */
 export function isKeyRelease(data: string): boolean {
 	// Don't treat bracketed paste content as key release, even if it contains
-	// patterns like ":3F" (e.g., bluetooth MAC addresses like "90:62:3F:A5").
-	// Terminal.ts re-wraps paste content with bracketed paste markers before
-	// passing to TUI, so pasted data will always contain \x1b[200~.
+	// patterns that accidentally match. Terminal.ts re-wraps paste content with
+	// bracketed paste markers before passing to TUI, so pasted data will always
+	// contain \x1b[200~.
 	if (data.includes("\x1b[200~")) {
 		return false;
 	}
-
-	// Quick check: release events with flag 2 contain ":3"
-	// Format: \x1b[<codepoint>;<modifier>:3u
-	if (
-		data.includes(":3u") ||
-		data.includes(":3~") ||
-		data.includes(":3A") ||
-		data.includes(":3B") ||
-		data.includes(":3C") ||
-		data.includes(":3D") ||
-		data.includes(":3H") ||
-		data.includes(":3F")
-	) {
-		return true;
-	}
-	return false;
+	return parseKittySequence(data)?.eventType === "release";
 }
 
 /**
- * Check if the last parsed key event was a key repeat.
+ * Check if the given input is a key repeat event.
  * Only meaningful when Kitty keyboard protocol with flag 2 is active.
+ *
+ * Mirrors isKeyRelease(): uses the structured parse result, and input that
+ * cannot be structured-parsed as a Kitty repeat sequence is not a repeat.
  */
 export function isKeyRepeat(data: string): boolean {
-	// Don't treat bracketed paste content as key repeat, even if it contains
-	// patterns like ":2F". See isKeyRelease() for details.
+	// Don't treat bracketed paste content as key repeat. See isKeyRelease().
 	if (data.includes("\x1b[200~")) {
 		return false;
 	}
-
-	if (
-		data.includes(":2u") ||
-		data.includes(":2~") ||
-		data.includes(":2A") ||
-		data.includes(":2B") ||
-		data.includes(":2C") ||
-		data.includes(":2D") ||
-		data.includes(":2H") ||
-		data.includes(":2F")
-	) {
-		return true;
-	}
-	return false;
+	return parseKittySequence(data)?.eventType === "repeat";
 }
 
 function parseEventType(eventTypeStr: string | undefined): KeyEventType {

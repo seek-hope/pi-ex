@@ -116,13 +116,129 @@ Set `PI_SKIP_VERSION_CHECK=1` to disable the Pi version update check. Use `--off
 | `compaction.enabled` | boolean | `true` | Enable auto-compaction |
 | `compaction.reserveTokens` | number | `16384` | Tokens reserved for LLM response |
 | `compaction.keepRecentTokens` | number | `20000` | Recent tokens to keep (not summarized) |
+| `compaction.quality` | `"structured"` \| `"standard"` | `"structured"` | Checkpoint format: structured (contract + ledger + verifier) or legacy narrative summary |
+| `compaction.prune.enabled` | boolean | `true` | Prune bulky old read-only tool outputs from the context view before compaction |
+| `compaction.prune.keepRecentToolResults` | number | `3` | Most recent tool results never pruned |
+| `compaction.prune.minPrunableTokens` | number | `1000` | Only prune results at or above this size |
+| `compaction.prune.headChars` | number | `400` | Leading characters of the original output to keep |
 
 ```json
 {
   "compaction": {
     "enabled": true,
     "reserveTokens": 16384,
-    "keepRecentTokens": 20000
+    "keepRecentTokens": 20000,
+    "quality": "structured",
+    "prune": {
+      "enabled": true,
+      "keepRecentToolResults": 3,
+      "minPrunableTokens": 1000,
+      "headChars": 400
+    }
+  }
+}
+```
+
+### Todo
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `todo.enabled` | boolean | `true` | Enable the todo flow (`todo_write` tool, todo widget, `/todo` command) |
+
+```json
+{
+  "todo": {
+    "enabled": true
+  }
+}
+```
+
+### Btw
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `btw.enabled` | boolean | `true` | Enable the `/btw` side-query command |
+
+```json
+{
+  "btw": {
+    "enabled": true
+  }
+}
+```
+
+### Background Tasks
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `backgroundTasks.enabled` | boolean | `true` | Enable tmux background tasks (`bg_spawn`/`bg_status` tools, `/tasks` `/fg` `/kill` `/attach` commands) |
+
+```json
+{
+  "backgroundTasks": {
+    "enabled": true
+  }
+}
+```
+
+### SSH
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `ssh.enabled` | boolean | `true` | Enable persistent SSH connections (`ssh_exec`/`ssh_status`/`scp_to_remote`/`scp_from_remote` tools, `/ssh` command) |
+
+```json
+{
+  "ssh": {
+    "enabled": true
+  }
+}
+```
+
+### Computer Use
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `computerUse.enabled` | boolean | `true` | Enable desktop automation (`computer_*` tools). Only takes effect on Hyprland/Wayland with grim/ydotool/wtype/hyprctl installed |
+
+```json
+{
+  "computerUse": {
+    "enabled": true
+  }
+}
+```
+
+### Recall
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `recall.enabled` | boolean | `true` | Enable the `recall`/`recall_checkpoints` archive-retrieval tools |
+
+```json
+{
+  "recall": {
+    "enabled": true
+  }
+}
+```
+
+### Sub-agents
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `subagents.enabled` | boolean | `true` | Enable in-process sub-agents (`subagent_*` tools, `/subagent` command) |
+| `subagents.maxDepth` | number | `5` | Maximum recursive spawn depth |
+| `subagents.maxConcurrent` | number | `5` | Maximum simultaneously running sub-agents |
+| `subagents.timeout` | number | `7200` | Per-run timeout in seconds (2h) |
+
+```json
+{
+  "subagents": {
+    "enabled": true,
+    "maxDepth": 5,
+    "maxConcurrent": 5,
+    "timeout": 7200
   }
 }
 ```
@@ -141,7 +257,7 @@ Set `PI_SKIP_VERSION_CHECK=1` to disable the Pi version update check. Use `--off
 | `retry.enabled` | boolean | `true` | Enable automatic agent-level retry on transient errors |
 | `retry.maxRetries` | number | `3` | Maximum agent-level retry attempts |
 | `retry.baseDelayMs` | number | `2000` | Base delay for agent-level exponential backoff (2s, 4s, 8s) |
-| `retry.provider.timeoutMs` | number | SDK default | Provider/SDK request timeout in milliseconds |
+| `retry.provider.timeout` | number | SDK default | Provider/SDK request timeout in seconds |
 | `retry.provider.maxRetries` | number | `0` | Provider/SDK retry attempts |
 | `retry.provider.maxRetryDelayMs` | number | `60000` | Max server-requested delay before failing (60s) |
 
@@ -156,7 +272,7 @@ Keep `retry.provider.maxRetries` at `0` unless provider-level retries are explic
     "maxRetries": 3,
     "baseDelayMs": 2000,
     "provider": {
-      "timeoutMs": 3600000,
+      "timeout": 3600,
       "maxRetries": 0,
       "maxRetryDelayMs": 60000
     }

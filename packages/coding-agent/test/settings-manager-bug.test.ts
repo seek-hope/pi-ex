@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { SettingsManager } from "../src/core/settings-manager.ts";
+import { FileSettingsStorage, SettingsManager } from "../src/core/settings-manager.ts";
 
 /**
  * Tests for the fix to a bug where external file changes to arrays were overwritten.
@@ -143,5 +143,38 @@ describe("SettingsManager - External Edit Preservation", () => {
 
 		const savedProjectSettings = JSON.parse(readFileSync(projectSettingsPath, "utf-8"));
 		expect(savedProjectSettings.extensions).toEqual(["./in-memory-extension.ts"]);
+	});
+
+	it("should not lose a first write when the settings file does not exist yet", () => {
+		const freshDir = join(testDir, "fresh-project");
+		const freshStorage = new FileSettingsStorage(freshDir, agentDir);
+		const settingsPath = join(freshDir, ".pi", "settings.json");
+
+		// The .pi dir and settings.json do not exist yet — this is the first-creation
+		// path where the lock must cover the full read-modify-write to avoid lost
+		// updates from concurrent first-writers.
+		expect(existsSync(join(freshDir, ".pi"))).toBe(false);
+
+		freshStorage.withLock("project", (current) => {
+			// Merge, preserving anything already on disk (a concurrent writer may have
+			// created the file between our read and this write).
+			const existing = current ? (JSON.parse(current) as Record<string, unknown>) : {};
+			return JSON.stringify({ ...existing, theme: "dark" }, null, 2);
+		});
+
+		expect(existsSync(settingsPath)).toBe(true);
+		expect(JSON.parse(readFileSync(settingsPath, "utf-8")).theme).toBe("dark");
+
+		// A second write through a separate storage instance must see the file created
+		// by the first (not blind-write over an empty buffer), so the first write is
+		// not lost.
+		new FileSettingsStorage(freshDir, agentDir).withLock("project", (current) => {
+			const existing = current ? (JSON.parse(current) as Record<string, unknown>) : {};
+			return JSON.stringify({ ...existing, packages: ["npm:pi-mcp-adapter"] }, null, 2);
+		});
+
+		const finalSettings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+		expect(finalSettings.theme).toBe("dark");
+		expect(finalSettings.packages).toEqual(["npm:pi-mcp-adapter"]);
 	});
 });

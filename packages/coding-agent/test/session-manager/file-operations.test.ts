@@ -2,7 +2,7 @@ import { constants as bufferConstants } from "buffer";
 import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { findMostRecentSession, loadEntriesFromFile, SessionManager } from "../../src/core/session-manager.ts";
 
 const HEADER_SCAN_LIMIT_BYTES = 1024 * 1024;
@@ -78,6 +78,23 @@ describe("loadEntriesFromFile", () => {
 		);
 		const entries = loadEntriesFromFile(file);
 		expect(entries).toHaveLength(2);
+	});
+
+	it("warns about malformed lines without changing skip behavior", () => {
+		const file = join(tempDir, "warn-malformed.jsonl");
+		writeFileSync(
+			file,
+			'{"type":"session","id":"abc","timestamp":"2025-01-01T00:00:00Z","cwd":"/tmp"}\n' + "not valid json\n",
+		);
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			const entries = loadEntriesFromFile(file);
+			expect(entries).toHaveLength(1); // skip behavior unchanged
+			expect(warnSpy).toHaveBeenCalled();
+			expect(String(warnSpy.mock.calls[0][0])).toContain("skipping malformed line");
+		} finally {
+			warnSpy.mockRestore();
+		}
 	});
 
 	it.each([

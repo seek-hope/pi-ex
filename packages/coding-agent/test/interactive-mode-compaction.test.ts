@@ -12,13 +12,19 @@ describe("InteractiveMode compaction events", () => {
 			statusContainer: { clear: vi.fn() },
 			chatContainer: { clear: vi.fn() },
 			rebuildChatFromMessages: vi.fn(),
+			renderSessionEntries: vi.fn(),
 			addMessageToChat: vi.fn(),
 			showError: vi.fn(),
 			showStatus: vi.fn(),
 			clearStatusIndicator: vi.fn(),
 			flushCompactionQueue: vi.fn().mockResolvedValue(undefined),
 			settingsManager: { getShowTerminalProgress: () => false },
-			ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
+			ui: {
+				requestRender: vi.fn(),
+				terminal: { setProgress: vi.fn() },
+				clearScrollback: vi.fn(),
+			},
+			sessionManager: { buildContextEntries: vi.fn().mockReturnValue([]) },
 		};
 
 		const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
@@ -45,7 +51,11 @@ describe("InteractiveMode compaction events", () => {
 		});
 
 		expect(fakeThis.chatContainer.clear).toHaveBeenCalledTimes(1);
-		expect(fakeThis.rebuildChatFromMessages).toHaveBeenCalledTimes(1);
+		expect(fakeThis.ui.clearScrollback).toHaveBeenCalledTimes(1);
+		// Old pre-compaction messages must not be re-rendered: only the entries
+		// created after the compaction plus the summary itself.
+		expect(fakeThis.sessionManager.buildContextEntries).toHaveBeenCalledWith({ afterCompaction: true });
+		expect(fakeThis.rebuildChatFromMessages).not.toHaveBeenCalled();
 		expect(fakeThis.addMessageToChat).toHaveBeenCalledTimes(1);
 		expect(fakeThis.addMessageToChat).toHaveBeenCalledWith(
 			expect.objectContaining({

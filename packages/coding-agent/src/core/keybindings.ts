@@ -21,6 +21,7 @@ export interface AppKeybindings {
 	"app.model.select": true;
 	"app.tools.expand": true;
 	"app.thinking.toggle": true;
+	"app.bg.tasks.manage": true;
 	"app.session.toggleNamedFilter": true;
 	"app.editor.external": true;
 	"app.message.copy": true;
@@ -87,6 +88,10 @@ export const KEYBINDINGS = {
 	"app.thinking.toggle": {
 		defaultKeys: "ctrl+t",
 		description: "Toggle thinking blocks",
+	},
+	"app.bg.tasks.manage": {
+		defaultKeys: [], // unbound by default — use /tasks (ctrl+shift+t collides with common terminal shortcuts)
+		description: "Toggle background task manager",
 	},
 	"app.session.toggleNamedFilter": {
 		defaultKeys: "ctrl+n",
@@ -281,7 +286,12 @@ function toKeybindingsConfig(value: Record<string, unknown>): KeybindingsConfig 
 		}
 		if (Array.isArray(binding) && binding.every((entry) => typeof entry === "string")) {
 			config[key] = binding as KeyId[];
+			continue;
 		}
+		// Invalid entries are skipped, but make them visible (does not change skip behavior).
+		console.warn(
+			`keybindings: ignoring invalid binding for "${key}" (expected a key id string or an array of key id strings)`,
+		);
 	}
 	return config;
 }
@@ -347,22 +357,27 @@ export class KeybindingsManager extends TuiKeybindingsManager {
 
 	static create(agentDir: string = getAgentDir()): KeybindingsManager {
 		const configPath = join(agentDir, "keybindings.json");
-		const userBindings = KeybindingsManager.loadFromFile(configPath);
+		const userBindings = KeybindingsManager.loadFromFile(configPath) ?? {};
 		return new KeybindingsManager(userBindings, configPath);
 	}
 
 	reload(): void {
 		if (!this.configPath) return;
-		this.setUserBindings(KeybindingsManager.loadFromFile(this.configPath));
+		const userBindings = KeybindingsManager.loadFromFile(this.configPath);
+		if (userBindings === undefined) {
+			console.warn(`keybindings: failed to reload from ${this.configPath}; keeping previously loaded bindings`);
+			return;
+		}
+		this.setUserBindings(userBindings);
 	}
 
 	getEffectiveConfig(): KeybindingsConfig {
 		return this.getResolvedBindings();
 	}
 
-	private static loadFromFile(path: string): KeybindingsConfig {
+	private static loadFromFile(path: string): KeybindingsConfig | undefined {
 		const rawConfig = loadRawConfig(path);
-		if (!rawConfig) return {};
+		if (!rawConfig) return undefined;
 		return toKeybindingsConfig(migrateKeybindingsConfig(rawConfig).config);
 	}
 }

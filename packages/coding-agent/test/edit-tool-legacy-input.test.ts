@@ -84,7 +84,14 @@ describe("edit tool prepareArguments", () => {
 		});
 
 		const result = await definition.execute("tool-1", prepared, undefined, undefined, {} as ExtensionContext);
-		expect(result.content).toEqual([{ type: "text", text: "Successfully replaced 1 block(s) in legacy.txt." }]);
+		expect(result.content).toEqual([
+			{
+				type: "text",
+				text: expect.stringMatching(
+					/^Successfully replaced 1 block\(s\) in legacy\.txt\. \(modified \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}\)$/,
+				),
+			},
+		]);
 		expect(await readFile(filePath, "utf8")).toBe("after\n");
 	});
 });

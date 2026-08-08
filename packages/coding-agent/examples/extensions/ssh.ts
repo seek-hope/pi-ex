@@ -23,6 +23,7 @@ import {
 	createWriteTool,
 	type EditOperations,
 	type ReadOperations,
+	timeoutToMs,
 	type WriteOperations,
 } from "@earendil-works/pi-coding-agent";
 
@@ -90,7 +91,7 @@ function createRemoteBashOps(remote: string, remoteCwd: string, localCwd: string
 					? setTimeout(() => {
 							timedOut = true;
 							child.kill();
-						}, timeout * 1000)
+						}, timeoutToMs(timeout))
 					: undefined;
 				child.stdout.on("data", onData);
 				child.stderr.on("data", onData);

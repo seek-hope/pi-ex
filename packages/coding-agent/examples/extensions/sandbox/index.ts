@@ -46,7 +46,13 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { SandboxManager, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { type BashOperations, CONFIG_DIR_NAME, createBashTool, getAgentDir } from "@earendil-works/pi-coding-agent";
+import {
+	type BashOperations,
+	CONFIG_DIR_NAME,
+	createBashTool,
+	getAgentDir,
+	timeoutToMs,
+} from "@earendil-works/pi-coding-agent";
 
 interface SandboxConfig extends SandboxRuntimeConfig {
 	enabled?: boolean;
@@ -148,7 +154,8 @@ function createSandboxedBashOps(): BashOperations {
 				let timedOut = false;
 				let timeoutHandle: NodeJS.Timeout | undefined;
 
-				if (timeout !== undefined && timeout > 0) {
+				const timeoutMs = timeout ? timeoutToMs(timeout) : undefined;
+				if (timeoutMs !== undefined) {
 					timeoutHandle = setTimeout(() => {
 						timedOut = true;
 						if (child.pid) {
@@ -158,7 +165,7 @@ function createSandboxedBashOps(): BashOperations {
 								child.kill("SIGKILL");
 							}
 						}
-					}, timeout * 1000);
+					}, timeoutMs);
 				}
 
 				child.stdout?.on("data", onData);

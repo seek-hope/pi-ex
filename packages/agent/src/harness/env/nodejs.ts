@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { constants, createReadStream } from "node:fs";
+import { constants, createReadStream, rmSync } from "node:fs";
 import {
 	access,
 	appendFile,
@@ -344,6 +344,25 @@ function waitForChildProcess(child: ChildProcess): Promise<number | null> {
 	});
 }
 
+const trackedTempFiles = new Set<string>();
+let tempExitCleanupInstalled = false;
+
+/** Remember temp files so a process exit can sweep stragglers (e.g. bash full-output logs). */
+function trackTempFile(filePath: string): void {
+	trackedTempFiles.add(filePath);
+	if (tempExitCleanupInstalled) return;
+	tempExitCleanupInstalled = true;
+	process.on("exit", () => {
+		for (const file of trackedTempFiles) {
+			try {
+				rmSync(file, { force: true });
+			} catch {
+				/* ok */
+			}
+		}
+	});
+}
+
 export class NodeExecutionEnv implements ExecutionEnv {
 	cwd: string;
 	private shellPath?: string;
@@ -682,6 +701,7 @@ export class NodeExecutionEnv implements ExecutionEnv {
 		const filePath = join(dir.value, `${options?.prefix ?? ""}${randomUUID()}${options?.suffix ?? ""}`);
 		try {
 			await writeFile(filePath, "");
+			trackTempFile(filePath);
 			return ok(filePath);
 		} catch (error) {
 			return err(toFileError(error, filePath));

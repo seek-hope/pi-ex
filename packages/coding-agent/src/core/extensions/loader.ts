@@ -104,6 +104,7 @@ function getAliases(): Record<string, string> {
 
 	const piCodingAgentEntry = packageIndex;
 	const piAgentCoreEntry = resolveWorkspaceOrImport("agent/dist/index.js", "@earendil-works/pi-agent-core");
+	const piAgentCoreNodeEntry = resolveWorkspaceOrImport("agent/dist/node.js", "@earendil-works/pi-agent-core/node");
 	const piTuiEntry = resolveWorkspaceOrImport("tui/dist/index.js", "@earendil-works/pi-tui");
 	// Extensions resolve the pi-ai root to the compat entrypoint (a strict
 	// superset of the core entrypoint): existing extensions using the old
@@ -117,6 +118,7 @@ function getAliases(): Record<string, string> {
 
 	_aliases = {
 		"@earendil-works/pi-coding-agent": piCodingAgentEntry,
+		"@earendil-works/pi-agent-core/node": piAgentCoreNodeEntry,
 		"@earendil-works/pi-agent-core": piAgentCoreEntry,
 		"@earendil-works/pi-tui": piTuiEntry,
 		"@earendil-works/pi-ai/providers/all": piAiProvidersEntry,
@@ -124,6 +126,7 @@ function getAliases(): Record<string, string> {
 		"@earendil-works/pi-ai/oauth": piAiOauthEntry,
 		"@earendil-works/pi-ai": piAiCompatEntry,
 		"@mariozechner/pi-coding-agent": piCodingAgentEntry,
+		"@mariozechner/pi-agent-core/node": piAgentCoreNodeEntry,
 		"@mariozechner/pi-agent-core": piAgentCoreEntry,
 		"@mariozechner/pi-tui": piTuiEntry,
 		"@mariozechner/pi-ai/providers/all": piAiProvidersEntry,
@@ -433,6 +436,28 @@ function isCurrentCacheToken(cacheToken: ExtensionCacheToken | undefined): cache
 	);
 }
 
+// Loading a single extension must never block startup/reload forever: a broken
+// extension (e.g. a top-level await that never resolves) would otherwise hang
+// every subsequent extension and the whole session.
+const EXTENSION_LOAD_TIMEOUT_MS = 10_000;
+
+async function withLoadTimeout<T>(promise: Promise<T>, what: string): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(
+					() => reject(new Error(`${what} timed out after ${EXTENSION_LOAD_TIMEOUT_MS}ms`)),
+					EXTENSION_LOAD_TIMEOUT_MS,
+				);
+			}),
+		]);
+	} finally {
+		if (timer !== undefined) clearTimeout(timer);
+	}
+}
+
 async function loadExtensionModule(extensionPath: string, cacheToken?: ExtensionCacheToken) {
 	if (isCurrentCacheToken(cacheToken)) {
 		const cachedFactory = extensionCache.get(extensionPath);
@@ -452,7 +477,10 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 				: { alias: getAliases() }),
 	});
 
-	const module = await jiti.import(extensionPath, { default: true });
+	const module = await withLoadTimeout(
+		jiti.import(extensionPath, { default: true }),
+		`extension module ${extensionPath}`,
+	);
 	const factory = module as ExtensionFactory;
 	if (typeof factory !== "function") {
 		return undefined;
@@ -505,7 +533,7 @@ async function loadExtension(
 
 		const extension = createExtension(extensionPath, resolvedPath);
 		const api = createExtensionAPI(extension, runtime, cwd, eventBus);
-		await factory(api);
+		await withLoadTimeout(Promise.resolve(factory(api)), `extension factory ${extensionPath}`);
 		time(`${extensionPath} factory`, "extensions");
 
 		return { extension, error: null };
@@ -528,7 +556,7 @@ export async function loadExtensionFromFactory(
 	const extension = createExtension(extensionPath, extensionPath);
 	const resolvedCwd = resolvePath(cwd);
 	const api = createExtensionAPI(extension, runtime, resolvedCwd, eventBus);
-	await factory(api);
+	await withLoadTimeout(Promise.resolve(factory(api)), `extension factory ${extensionPath}`);
 	time(`${extensionPath} factory`, "extensions");
 	return extension;
 }

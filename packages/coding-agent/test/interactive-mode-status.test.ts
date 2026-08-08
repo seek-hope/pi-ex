@@ -382,7 +382,7 @@ describe("InteractiveMode.createBaseAutocompleteProvider", () => {
 		type FakeInteractiveMode = {
 			session: {
 				scopedModels: Array<{ model: TestModel }>;
-				modelRuntime: { getAvailableSnapshot: () => TestModel[] };
+				modelRuntime: { getAvailable: () => TestModel[]; getAvailableSnapshot: () => TestModel[] };
 				promptTemplates: [];
 				extensionRunner: { getRegisteredCommands: () => [] };
 				resourceLoader: { getSkills: () => { skills: [] } };
@@ -405,7 +405,9 @@ describe("InteractiveMode.createBaseAutocompleteProvider", () => {
 		const fakeThis: FakeInteractiveMode = {
 			session: {
 				scopedModels: [],
-				modelRuntime: { getAvailableSnapshot: () => models },
+
+				modelRuntime: { getAvailable: () => models, getAvailableSnapshot: () => models },
+
 				promptTemplates: [],
 				extensionRunner: { getRegisteredCommands: () => [] },
 				resourceLoader: { getSkills: () => ({ skills: [] }) },
@@ -432,7 +434,9 @@ describe("InteractiveMode.createBaseAutocompleteProvider", () => {
 		type FakeInteractiveMode = {
 			session: {
 				scopedModels: [];
-				modelRuntime: { getAvailableSnapshot: () => [] };
+
+				modelRuntime: { getAvailable: () => []; getAvailableSnapshot: () => [] };
+
 				promptTemplates: [];
 				extensionRunner: { getRegisteredCommands: () => [] };
 				resourceLoader: { getSkills: () => { skills: [] } };
@@ -452,7 +456,9 @@ describe("InteractiveMode.createBaseAutocompleteProvider", () => {
 		const fakeThis: FakeInteractiveMode = {
 			session: {
 				scopedModels: [],
-				modelRuntime: { getAvailableSnapshot: () => [] },
+
+				modelRuntime: { getAvailable: () => [], getAvailableSnapshot: () => [] },
+
 				promptTemplates: [],
 				extensionRunner: { getRegisteredCommands: () => [] },
 				resourceLoader: { getSkills: () => ({ skills: [] }) },

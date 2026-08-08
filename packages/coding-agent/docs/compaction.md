@@ -22,6 +22,27 @@ Pi has two summarization mechanisms:
 
 Both use the same structured summary format and track file operations cumulatively. Compaction and branch-summary requests use fresh routing session IDs and, where supported by the provider, disable prompt-cache writes because these one-off prompts are unlikely to be reused.
 
+## Structured Checkpoints (quality: "structured")
+
+By default, compaction produces a **structured checkpoint** instead of a single narrative summary. The checkpoint has four layers:
+
+1. **Task Contract** — the authoritative statement of the user's current requirements: goal, constraints with explicit lifecycle (`ACTIVE`/`SUPERSEDED`/`UNRESOLVED` with supersession chains), user-confirmed decisions, and open questions. The intent compiler receives the **full conversation as role-tagged JSON** (no truncation, no heuristic message parsing): `"user"` entries are authoritative, `"assistant"` entries are present for context but explicitly marked untrusted, so abandoned approaches and early wrong assumptions cannot silently become requirements. The verifier pass then audits the compiled contract against the full transcript.
+2. **World State** — a deterministic **Action Ledger** (file modifications, command executions, git commits, sub-agent operations) extracted from the message stream without an LLM, plus cumulative read/modified file tracking.
+3. **Execution State** — current approach, done/in-progress/blocked, next steps, **model inferences explicitly marked unverified**, and external state observations with source/refresh hints.
+4. **Verification Notes** — output of a verifier pass that audits the contract against the full transcript (missing constraints, wrongly superseded items, contradictions with tool-verified facts) and applies corrections.
+
+The markdown checkpoint is what the model sees; the contract and ledger are also stored as JSON in `CompactionEntry.details` (`version: 2`) so the next compaction round and the `recall` tools can consume them.
+
+Set `"compaction": { "quality": "standard" }` to restore the legacy narrative summary. Overflow recovery always falls back to the standard path, and any checkpoint failure falls back as well.
+
+### Context pruning before compaction
+
+Before compaction triggers, pi prunes bulky old read-only tool outputs (read/bash/grep/find/ls) from the **context view**, replacing them with short stubs. The session archive keeps the full output — retrieval is always possible via `recall`. Pruning often defers or avoids compaction entirely. Configure via `compaction.prune` (see [Settings](settings.md#compaction)).
+
+### Archive retrieval (recall)
+
+Compaction only changes which entries are sent to the LLM — the session JSONL tree is append-only and never deletes content. The built-in `recall` tool searches the archived span by keyword/regex, file path, or exact entry id, and `recall_checkpoints` lists past checkpoints. See [Settings](settings.md#recall).
+
 ## Compaction
 
 ### When It Triggers

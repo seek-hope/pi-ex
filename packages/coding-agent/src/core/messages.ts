@@ -97,12 +97,19 @@ export function bashExecutionToText(msg: BashExecutionMessage): string {
 	return text;
 }
 
+// A malformed/empty timestamp would produce NaN, which corrupts ordering and
+// rendering downstream, so fall back to the current time for unparseable input.
+function parseTimestampMillis(timestamp: string): number {
+	const millis = new Date(timestamp).getTime();
+	return Number.isNaN(millis) ? Date.now() : millis;
+}
+
 export function createBranchSummaryMessage(summary: string, fromId: string, timestamp: string): BranchSummaryMessage {
 	return {
 		role: "branchSummary",
 		summary,
 		fromId,
-		timestamp: new Date(timestamp).getTime(),
+		timestamp: parseTimestampMillis(timestamp),
 	};
 }
 
@@ -115,7 +122,7 @@ export function createCompactionSummaryMessage(
 		role: "compactionSummary",
 		summary: summary,
 		tokensBefore,
-		timestamp: new Date(timestamp).getTime(),
+		timestamp: parseTimestampMillis(timestamp),
 	};
 }
 
@@ -133,7 +140,7 @@ export function createCustomMessage(
 		content,
 		display,
 		details,
-		timestamp: new Date(timestamp).getTime(),
+		timestamp: parseTimestampMillis(timestamp),
 	};
 }
 

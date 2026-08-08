@@ -31,6 +31,9 @@ import {
 // Types
 // ============================================================================
 
+/** Summaries still fit when the filled budget stays below this fraction. */
+const SUMMARY_FIT_RATIO = 0.9;
+
 export interface BranchSummaryResult {
 	summary?: string;
 	usage?: Usage;
@@ -230,7 +233,7 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 		if (tokenBudget > 0 && totalTokens + tokens > tokenBudget) {
 			// If this is a summary entry, try to fit it anyway as it's important context
 			if (entry.type === "compaction" || entry.type === "branch_summary") {
-				if (totalTokens < tokenBudget * 0.9) {
+				if (totalTokens < tokenBudget * SUMMARY_FIT_RATIO) {
 					messages.unshift(message);
 					totalTokens += tokens;
 				}

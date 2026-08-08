@@ -135,14 +135,16 @@ describe("createAgentSession stream options", () => {
 		expect(options?.timeoutMs).toBe(1234);
 	});
 
-	it("lets request timeoutMs override httpIdleTimeoutMs for OpenAI Codex", async () => {
+	it("normalizes request timeoutMs of 0 to disabled for OpenAI Codex", async () => {
 		const options = await captureStreamOptions(
 			"openai-codex-responses",
 			{ httpIdleTimeoutMs: 1234 },
 			{ timeoutMs: 0 },
 		);
 
-		expect(options?.timeoutMs).toBe(0);
+		// timeout=0 means "disable timeout"; it is normalized to max int32 so the
+		// SDK does not treat it as an immediate 0ms timeout.
+		expect(options?.timeoutMs).toBe(2147483647);
 	});
 
 	it("forwards websocketConnectTimeoutMs from settings", async () => {

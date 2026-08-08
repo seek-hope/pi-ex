@@ -353,6 +353,15 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.requestRender();
 	}
 
+	/** Reset the viewport and drop all rendered history (e.g. after compaction). */
+	clearScrollback(): void {
+		if (this.stopped) return;
+		this.resetRenderState();
+		this.getPrimaryScrollView().scrollToEnd();
+		this.terminal.write("\x1b[2J\x1b[H");
+		this.requestRender(true);
+	}
+
 	scrollToTop(): void {
 		this.getPrimaryScrollView().scrollToStart();
 		this.requestRender();

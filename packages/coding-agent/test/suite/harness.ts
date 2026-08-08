@@ -1,4 +1,5 @@
 import { createInMemoryModelRegistry, createModelRegistry, getModelRuntime } from "../model-runtime-test-utils.ts";
+
 /**
  * Local test harness for the new coding-agent test suite.
  */
@@ -100,6 +101,18 @@ function createTempDir(): string {
 
 export async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
 	const tempDir = createTempDir();
+	// Ensure git identity for tests that use git (subagent). Environment
+	// variables work even when the test runner isolates git config files
+	// (e.g. test.sh sets GIT_CONFIG_GLOBAL=/dev/null, which makes
+	// `git config --global` a no-op and commits fail with "Author identity
+	// unknown").
+	// ||= (not ??=): an ambient EMPTY-string GIT_AUTHOR_* is kept by ??= but
+	// makes every git commit die with "empty ident". Non-empty ambient values
+	// are kept — they still produce valid commits in the throwaway test repos.
+	process.env.GIT_AUTHOR_NAME ||= "pi-test";
+	process.env.GIT_AUTHOR_EMAIL ||= "pi-test@example.com";
+	process.env.GIT_COMMITTER_NAME ||= "pi-test";
+	process.env.GIT_COMMITTER_EMAIL ||= "pi-test@example.com";
 	const fauxProvider: FauxProviderRegistration = registerFauxProvider({
 		models: options.models,
 	});
