@@ -1153,35 +1153,6 @@ export class SessionManager {
 		return entry.id;
 	}
 
-	/** Update the summary text of a compaction entry (e.g. after user review). */
-	updateCompactionSummary(entryId: string, newSummary: string): boolean {
-		const entry = this.byId.get(entryId);
-		if (!entry || entry.type !== "compaction") return false;
-		(entry as CompactionEntry).summary = newSummary;
-		// Persist: without the rewrite the updated summary only lives in memory
-		// and dismissed review markers are lost on restart.
-		this._rewriteFile();
-		return true;
-	}
-
-	/**
-	 * Mark a compaction entry as reviewed by the user. Persisted in the
-	 * entry's details so /review is not offered again after a restart.
-	 */
-	markCompactionReviewed(entryId: string): boolean {
-		const entry = this.byId.get(entryId);
-		if (!entry || entry.type !== "compaction") return false;
-		const compaction = entry as CompactionEntry;
-		const details =
-			compaction.details && typeof compaction.details === "object"
-				? { ...(compaction.details as Record<string, unknown>) }
-				: {};
-		details.reviewedAt = new Date().toISOString();
-		compaction.details = details;
-		this._rewriteFile();
-		return true;
-	}
-
 	/**
 	 * Return the latest compaction entry on the active branch, if any.
 	 * Used to restore a pending /review after a session restart.
