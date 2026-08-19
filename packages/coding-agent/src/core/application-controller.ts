@@ -17,7 +17,7 @@ import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai/compat";
 import type { AgentSession, AgentSessionEventListener, ModelCycleResult, PromptOptions } from "./agent-session.ts";
 import type { AgentSessionRuntime } from "./agent-session-runtime.ts";
-import type { CompactionResult } from "./compaction/fork.ts";
+import type { CompactionResult } from "./compaction/index.ts";
 import type { InteractionPort } from "./interaction-port.ts";
 import type { SessionTreeNode } from "./session-manager.ts";
 
@@ -358,13 +358,6 @@ export class ApplicationController {
 	/** Current effective system prompt (includes per-turn extension modifications). */
 	get systemPrompt(): AgentSession["systemPrompt"] {
 		return this._session.systemPrompt;
-	}
-
-	/** UI response to an outstanding override confirmation. */
-	respondOverrideConfirmation(
-		...args: Parameters<AgentSession["respondOverrideConfirmation"]>
-	): ReturnType<AgentSession["respondOverrideConfirmation"]> {
-		return this._session.respondOverrideConfirmation(...args);
 	}
 
 	/** Look up a tool definition by name. */

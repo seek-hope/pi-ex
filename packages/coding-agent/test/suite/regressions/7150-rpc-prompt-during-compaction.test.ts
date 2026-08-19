@@ -22,7 +22,7 @@ describe("issue #7150: RPC prompt during manual compaction", () => {
 		});
 
 		const harness = await createHarness({
-			settings: { compaction: { keepRecentRounds: 1 } },
+			settings: { compaction: { keepRecentTokens: 1 } },
 			extensionFactories: [
 				(pi) => {
 					pi.on("session_before_compact", async (event) => {
@@ -50,16 +50,6 @@ describe("issue #7150: RPC prompt during manual compaction", () => {
 		});
 		harness.sessionManager.appendMessage(
 			fauxAssistantMessage("old assistant response", { timestamp: timestamp - 500 }),
-		);
-		// Second round: with keepRecentRounds: 1 only the last round is kept, so
-		// the first round is what gets summarized.
-		harness.sessionManager.appendMessage({
-			role: "user",
-			content: [{ type: "text", text: "old user message 2" }],
-			timestamp: timestamp - 300,
-		});
-		harness.sessionManager.appendMessage(
-			fauxAssistantMessage("old assistant response 2", { timestamp: timestamp - 100 }),
 		);
 		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 		harness.setResponses([fauxAssistantMessage("probe response")]);

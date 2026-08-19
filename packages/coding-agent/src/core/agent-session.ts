@@ -59,31 +59,17 @@ import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import {
-	type AutoReviewCandidate,
-	parseConflictIds,
-	runAutoReview,
-	type UserOverrideProposal,
-} from "./compaction/auto-review.ts";
-import { compactStructured } from "./compaction/checkpoint.ts";
-import { completeSummarization } from "./compaction/compaction.ts";
-import { runContentDedup } from "./compaction/content-dedup.ts";
-import type { TaskContract } from "./compaction/contract.ts";
-import {
-	type CompactionDetails,
 	type CompactionPreparation,
 	type CompactionResult,
+	calculateContextTokens,
+	collectEntriesForBranchSummary,
 	compact,
 	estimateContextTokens,
 	estimateTokens,
+	generateBranchSummary,
 	prepareCompaction,
 	shouldCompact,
-} from "./compaction/fork.ts";
-import { estimateTextTokens } from "./compaction/fork-utils.ts";
-import { calculateContextTokens, collectEntriesForBranchSummary, generateBranchSummary } from "./compaction/index.ts";
-import type { ActionLedger } from "./compaction/ledger.ts";
-import { autoReviewSummaryItems } from "./compaction/summary-review.ts";
-import { UNCERTAINTY_PROTOCOL_PROMPT, UncertaintyStore } from "./compaction/uncertainty.ts";
-import { computeFileLists } from "./compaction/utils.ts";
+} from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
@@ -115,7 +101,6 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
-import { FileContextTracker, formatFileTime } from "./file-context.ts";
 import { FileChangeHistory, type FileRevertResult } from "./file-history.ts";
 import { getBgSpawner, registerForkHost } from "./fork-host.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
@@ -189,7 +174,7 @@ export type AgentSessionEvent =
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow";
-			result: CompactionResult | undefined;
+			result: SessionCompactionResult | undefined;
 			aborted: boolean;
 			willRetry: boolean;
 			errorMessage?: string;
@@ -211,16 +196,16 @@ export type AgentSessionEvent =
 	  }
 	| { type: "summarization_retry_finished" }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
-	| { type: "bash_execution_update"; id?: string; delta: string }
-	| {
-			type: "uncertainty_override_request";
-			proposal: {
-				flagId: string;
-				claim: string;
-				decision: "verified" | "dismissed" | "corrected";
-				correction?: string;
-			};
-	  };
+	| { type: "bash_execution_update"; id?: string; delta: string };
+
+/**
+ * fork(pi-ex): compaction result with entry id + post-compaction estimate for
+ * the TUI's afterCompaction display.
+ */
+export type SessionCompactionResult = CompactionResult & {
+	estimatedTokensAfter?: number;
+	compactionEntryId?: string;
+};
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
@@ -397,7 +382,6 @@ export class AgentSession {
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
-	private _fileContextTracker = new FileContextTracker();
 	private _fileHistory = new FileChangeHistory();
 
 	/** Sudo password for local bash (memory only, never persisted). */
@@ -463,9 +447,6 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
-		// Load the project path set for idle file-state rotation (git ls-files).
-		// Non-git directories simply skip the project-wide phase.
-		void this._loadProjectPaths();
 		this._modelRuntime = config.modelRuntime;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
@@ -726,12 +707,6 @@ export class AgentSession {
 
 	// Track last assistant message for auto-compaction check
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;
-	private _uncertaintyStore: UncertaintyStore | undefined = undefined;
-	private _autoReviewInFlight = false;
-	private _conflictCheckInFlight = false;
-	private _overrideConfirmation: { proposal: UserOverrideProposal; resolve: (accepted: boolean) => void } | undefined =
-		undefined;
-	private _overrideConfirmationTimer: ReturnType<typeof setTimeout> | undefined = undefined;
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
@@ -752,10 +727,6 @@ export class AgentSession {
 					if (followUpIndex !== -1) {
 						this._followUpMessages.splice(followUpIndex, 1);
 						this._emitQueueUpdate();
-					} else {
-						// Genuine user input: silently check whether it conflicts with
-						// any pending uncertainty flag (runs before the model responds).
-						this._detectIntentConflict(messageText);
 					}
 				}
 			}
@@ -766,12 +737,6 @@ export class AgentSession {
 
 		// Notify all listeners
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
-
-		if (event.type === "agent_end") {
-			// The agent is idle until the next user input — rotate the file-state
-			// checks now (stops again on the next prompt).
-			this._fileContextTracker.startRotation();
-		}
 
 		// Handle session persistence
 		if (event.type === "message_end") {
@@ -791,23 +756,6 @@ export class AgentSession {
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
 				const entryId = this.sessionManager.appendMessage(event.message);
-
-				// Incremental uncertainty review: scan assistant text for
-				// [uncertain:...] markers and queue them for the run-end prompt.
-				if (event.message.role === "assistant") {
-					this.uncertaintyStore.scanAssistantText(contentText(event.message.content, ""), entryId);
-				}
-
-				// Stale detection: a successful edit/write invalidates decisions
-				// whose subject file just changed.
-				if (
-					event.message.role === "toolResult" &&
-					!event.message.isError &&
-					(event.message.toolName === "edit" || event.message.toolName === "write")
-				) {
-					const modifiedPath = this._findToolCallPath(event.message.toolCallId);
-					if (modifiedPath) this.uncertaintyStore.markPathModified(modifiedPath);
-				}
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
@@ -833,282 +781,6 @@ export class AgentSession {
 			}
 		}
 	};
-
-	/** Incremental uncertainty review: pending flags + user decisions for this session. */
-	get uncertaintyStore(): UncertaintyStore {
-		if (!this._uncertaintyStore) {
-			this._uncertaintyStore = new UncertaintyStore(this.sessionManager);
-		}
-		return this._uncertaintyStore;
-	}
-
-	/**
-	 * Silent intent-conflict detection: the user's latest message may
-	 * contradict, supersede, or render irrelevant a pending or already-
-	 * decided uncertainty entry. Runs before the model responds
-	 * (fire-and-forget, never blocks or throws); a detected conflict
-	 * triggers the auto-review pass over the affected entries.
-	 */
-	private _detectIntentConflict(userText: string): void {
-		if (!this.settingsManager.getUncertaintyReviewAuto()) return;
-		if (this._conflictCheckInFlight || this._autoReviewInFlight) return;
-		const model = this.model;
-		if (!model) return;
-		const store = this.uncertaintyStore;
-		const entries = this._allUncertaintyEntries(store);
-		if (entries.length === 0) return;
-		this._conflictCheckInFlight = true;
-		void (async () => {
-			try {
-				const auth = await this._getSummarizationRequestAuth(model);
-				const prompt = this._conflictPrompt(userText, entries);
-				const message = await completeSummarization(
-					model,
-					{
-						messages: [
-							{
-								role: "user" as const,
-								content: [{ type: "text" as const, text: prompt }],
-								timestamp: Date.now(),
-							},
-						],
-					},
-					{
-						maxTokens: 200,
-						apiKey: auth.apiKey,
-						headers: auth.headers,
-						env: auth.env,
-						signal: AbortSignal.timeout(10_000),
-					},
-					this.agent.streamFunction,
-					this.settingsManager.getRetrySettings(),
-				);
-				const ids = parseConflictIds(contentText(message.content, ""));
-				if (ids.length > 0) {
-					await this._runAutoReviewIfEnabled(ids);
-				}
-			} catch {
-				// Silent: detection must never affect the conversation.
-			} finally {
-				this._conflictCheckInFlight = false;
-			}
-		})();
-	}
-
-	/** Pending flags + latest decision per flag, for conflict detection. */
-	private _allUncertaintyEntries(store: UncertaintyStore): Array<{ id: string; claim: string }> {
-		const entries = new Map<string, { id: string; claim: string }>();
-		for (const flag of store.pending()) entries.set(flag.id, { id: flag.id, claim: flag.claim });
-		for (const decision of store.decisions()) {
-			if (!entries.has(decision.flagId))
-				entries.set(decision.flagId, { id: decision.flagId, claim: decision.claim });
-		}
-		return [...entries.values()];
-	}
-
-	/**
-	 * Auto-review pass: the model re-settles candidates newest-first
-	 * against the current conversation. Pending flags are decided
-	 * directly; model rulings may be overturned directly; user rulings
-	 * are only changed after a confirmation popup (300s budget, silent
-	 * reject on timeout/no UI). Runs at compaction and after an intent
-	 * conflict.
-	 */
-	private async _runAutoReviewIfEnabled(conflictIds?: string[]): Promise<void> {
-		if (!this.settingsManager.getUncertaintyReviewAuto()) return;
-		const model = this.model;
-		if (!model) return;
-		const store = this.uncertaintyStore;
-		if (this._autoReviewInFlight) return;
-		if (this._reviewCandidates(store, conflictIds).length === 0) return;
-		this._autoReviewInFlight = true;
-		try {
-			const auth = await this._getSummarizationRequestAuth(model);
-			// Layer 1 (compaction only): content-level dedup — drop duplicate
-			// and contradicting flags (newest wins), before any context
-			// review, so redundancy never reaches the verdict pass.
-			if (!conflictIds) {
-				await runContentDedup(store, {
-					model,
-					streamFn: this.agent.streamFunction,
-					retry: this.settingsManager.getRetrySettings(),
-					apiKey: auth.apiKey,
-					headers: auth.headers,
-					env: auth.env,
-					signal: AbortSignal.timeout(120_000),
-					onUserOverrideProposal: (proposal) => this._confirmUserRulingOverride(proposal),
-				});
-			}
-			// Layer 2: context review of the surviving pending flags.
-			const candidates = this._reviewCandidates(store, conflictIds);
-			if (candidates.length === 0) return;
-			await runAutoReview(store, {
-				model,
-				streamFn: this.agent.streamFunction,
-				retry: this.settingsManager.getRetrySettings(),
-				apiKey: auth.apiKey,
-				headers: auth.headers,
-				env: auth.env,
-				contextText: this._recentConversationText(),
-				signal: AbortSignal.timeout(120_000),
-				candidates,
-				onUserOverrideProposal: (proposal) => this._confirmUserRulingOverride(proposal),
-			});
-		} catch {
-			// Silent: a failed review must never break compaction or the turn.
-		} finally {
-			this._autoReviewInFlight = false;
-		}
-	}
-
-	/**
-	 * Auto-review the uncertain sections of a compaction summary in one
-	 * batched model call; settled entries are marked in the returned text.
-	 * Never throws — failures return the summary unchanged.
-	 */
-	private async _autoReviewSummary(summary: string): Promise<string> {
-		const model = this.model;
-		if (!model) return summary;
-		try {
-			const auth = await this._getSummarizationRequestAuth(model);
-			return await autoReviewSummaryItems(summary, {
-				model,
-				streamFn: this.agent.streamFunction,
-				retry: this.settingsManager.getRetrySettings(),
-				apiKey: auth.apiKey,
-				headers: auth.headers,
-				env: auth.env,
-				contextText: this._recentConversationText(),
-				signal: AbortSignal.timeout(120_000),
-			});
-		} catch {
-			return summary;
-		}
-	}
-
-	/** Recent user/assistant messages as plain text (newest last), for review prompts. */
-	private _recentConversationText(maxMessages = 20): string {
-		const messages = this.agent.state.messages;
-		const parts: string[] = [];
-		for (const message of messages.slice(-maxMessages)) {
-			if (message.role !== "user" && message.role !== "assistant") continue;
-			const text = contentText(message.content, "").trim();
-			if (!text) continue;
-			parts.push(`${message.role}: ${text.slice(0, 600)}`);
-		}
-		return parts.join("\n");
-	}
-
-	private _conflictPrompt(userText: string, entries: Array<{ id: string; claim: string }>): string {
-		const list = entries
-			.slice(0, 10)
-			.map((f) => `- [${f.id}] ${f.claim}`)
-			.join("\n");
-		return [
-			"The user just said:",
-			`<user>${userText.slice(0, 1000)}</user>`,
-			"",
-			"The session has these uncertainty entries (pending and already reviewed):",
-			list,
-			"",
-			"Reply with ONLY a JSON array of flag ids whose statement is contradicted,",
-			"superseded, or rendered irrelevant by the user's latest message.",
-			"If none apply, reply []",
-		].join("\n");
-	}
-
-	/**
-	 * Review candidates, newest first. Without conflict ids: all pending
-	 * flags (compaction trigger). With conflict ids: those entries plus
-	 * any still-pending flags — already-decided entries are only
-	 * re-examined when the latest context actually touches them.
-	 */
-	private _reviewCandidates(store: UncertaintyStore, conflictIds?: string[]): AutoReviewCandidate[] {
-		const wanted = conflictIds ? new Set(conflictIds) : undefined;
-		const byId = new Map<string, AutoReviewCandidate>();
-		// Decided flags are only re-examined when the latest context
-		// actually touches them (conflict check). Compaction alone must not
-		// re-review the whole decision history on every run.
-		if (wanted) {
-			const decided = store.decisions();
-			// Newest first: decisions are appended chronologically, so walk
-			// them backwards.
-			for (let i = decided.length - 1; i >= 0; i--) {
-				const d = decided[i]!;
-				if (!wanted.has(d.flagId)) continue;
-				if (byId.has(d.flagId)) continue;
-				byId.set(d.flagId, {
-					id: d.flagId,
-					type: d.type,
-					claim: d.claim,
-					subject: d.subject,
-				});
-			}
-		}
-		const pending = store.pending();
-		// Pending flags sit at the tail of their arrival order (newest
-		// last), so walk backwards. Cap the batch at 100 newest — a
-		// backlog beyond that stays manual rather than stalling compaction.
-		for (let i = pending.length - 1; i >= 0 && byId.size < 100; i--) {
-			const f = pending[i]!;
-			if (wanted && !wanted.has(f.id)) continue;
-			if (byId.has(f.id)) continue;
-			byId.set(f.id, { id: f.id, type: f.type, claim: f.claim, subject: f.subject });
-		}
-		return [...byId.values()];
-	}
-
-	/**
-	 * Ask the user before overturning one of their rulings. Emits an event
-	 * the UI listens for; resolves true on confirmation. 300s budget — a
-	 * timeout (or no UI attached) silently keeps the user ruling.
-	 */
-	private async _confirmUserRulingOverride(proposal: UserOverrideProposal): Promise<boolean> {
-		if (this._overrideConfirmation) {
-			return false; // one confirmation at a time
-		}
-		return new Promise<boolean>((resolve) => {
-			const timer = setTimeout(() => {
-				this._overrideConfirmationTimer = undefined;
-				this._overrideConfirmation = undefined;
-				resolve(false);
-			}, 300_000);
-			this._overrideConfirmationTimer = timer;
-			this._overrideConfirmation = {
-				proposal,
-				resolve: (accepted) => {
-					this._overrideConfirmationTimer = undefined;
-					clearTimeout(timer);
-					this._overrideConfirmation = undefined;
-					resolve(accepted);
-				},
-			};
-			this._emit({ type: "uncertainty_override_request", proposal });
-		});
-	}
-
-	/** UI response to an outstanding override confirmation. */
-	respondOverrideConfirmation(accepted: boolean): boolean {
-		const pending = this._overrideConfirmation;
-		if (!pending) return false;
-		pending.resolve(accepted);
-		return true;
-	}
-
-	/** Look up the path argument of a file tool call by its toolCallId. */
-	private _findToolCallPath(toolCallId: string): string | undefined {
-		for (let i = this.agent.state.messages.length - 1; i >= 0; i--) {
-			const msg = this.agent.state.messages[i];
-			if (msg.role !== "assistant") continue;
-			for (const block of (msg as AssistantMessage).content) {
-				if (block.type === "toolCall" && block.id === toolCallId) {
-					const args = block.arguments as { path?: unknown } | undefined;
-					return typeof args?.path === "string" ? args.path : undefined;
-				}
-			}
-		}
-		return undefined;
-	}
 
 	/**
 	 * Wrap the edit tool so successful edits are followed by a reference scan:
@@ -1313,14 +985,6 @@ export class AgentSession {
 			this.agent.abort();
 		} catch {
 			// Dispose must succeed even if an abort hook throws.
-		}
-
-		// Release any pending uncertainty-override confirmation timer so it cannot
-		// fire callbacks against a disposed session.
-		if (this._overrideConfirmationTimer !== undefined) {
-			clearTimeout(this._overrideConfirmationTimer);
-			this._overrideConfirmationTimer = undefined;
-			this._overrideConfirmation = undefined;
 		}
 
 		this._extensionRunner.invalidate(
@@ -1536,7 +1200,6 @@ export class AgentSession {
 		// review is active (interactive runs collect and prompt on the flags).
 		const guidance: string[] = [WORK_LOOP_GUIDANCE];
 		if (this.settingsManager.getUncertaintyReviewTiming() === "incremental") {
-			guidance.push(UNCERTAINTY_PROTOCOL_PROMPT);
 		}
 		return `${prompt}\n\n${guidance.join("\n\n")}`;
 	}
@@ -1608,7 +1271,6 @@ export class AgentSession {
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		// A new input arrives — stop the idle file-state rotation promptly.
-		this._fileContextTracker.stopRotation();
 		// A non-extension input means the user is back: cancel any pending wait.
 		if (options?.source !== "extension") {
 		}
@@ -1770,53 +1432,7 @@ export class AgentSession {
 		}
 
 		preflightResult?.(true);
-		this._maybeWarnStaleFiles();
 		await this._runAgentPrompt(messages);
-	}
-
-	/** Inject a delta notice for files the model has seen that changed on disk. */
-	private _maybeWarnStaleFiles(): void {
-		try {
-			const notices = this._fileContextTracker.staleNotices();
-			if (notices.length === 0) return;
-			const lines = notices
-				.map((notice) => `- ${relativePath(this._cwd, notice.path)} (changed ${formatFileTime(notice.detectedAt)})`)
-				.join("\n");
-			const warning =
-				`[file-state] ${notices.length === 1 ? "1 file you have seen" : `${notices.length} files you have seen`} changed on disk since your last read:\n` +
-				`${lines}\n` +
-				`Re-read them before relying on their contents (they may differ from what you remember).`;
-			this._steeringMessages.push(warning);
-			this._emitQueueUpdate();
-			this.agent.steer({
-				role: "user",
-				content: [{ type: "text", text: warning }],
-				timestamp: Date.now(),
-			});
-			this._fileContextTracker.markNotified(notices.map((notice) => notice.path));
-		} catch {
-			/* non-critical */
-		}
-	}
-
-	/**
-	 * Load the project file list (git ls-files) for rotation. Failures degrade
-	 * silently — rotation then only covers files the model has touched.
-	 */
-	private async _loadProjectPaths(): Promise<void> {
-		try {
-			const { stdout } = await execFileAsync("git", ["ls-files", "-z"], {
-				cwd: this._cwd,
-				maxBuffer: 32 * 1024 * 1024,
-			});
-			const paths = stdout
-				.split("\0")
-				.filter(Boolean)
-				.map((p) => joinPath(this._cwd, p));
-			this._fileContextTracker.noteProjectPaths(paths);
-		} catch {
-			/* not a git repo — project-wide rotation unavailable */
-		}
 	}
 
 	/**
@@ -2329,98 +1945,6 @@ export class AgentSession {
 		this.settingsManager.setFollowUpMode(mode);
 	}
 
-	/** Latest structured checkpoint data from the current branch, if any. */
-	private _previousCheckpoint(): { contract?: TaskContract; ledger?: ActionLedger } {
-		const prev = getLatestCompactionEntry(this.sessionManager.getBranch());
-		const details = prev?.details as CompactionDetails | undefined;
-		return { contract: details?.contract, ledger: details?.ledger };
-	}
-
-	/**
-	 * Generate a compaction result honoring compaction.quality.
-	 * "structured" runs the checkpoint pipeline (contract + ledger + verifier);
-	 * any failure falls back to the standard narrative summary.
-	 */
-	private async _generateCompaction(
-		preparation: CompactionPreparation,
-		options: {
-			model: Model<any>;
-			customInstructions?: string;
-			signal: AbortSignal;
-			apiKey?: string;
-			headers?: Record<string, string>;
-			env?: Record<string, string>;
-			forceStandard?: boolean;
-			callbacks?: RetryCallbacks;
-		},
-	): Promise<CompactionResult> {
-		if (this.settingsManager.getCompactionQuality() === "structured" && !options.forceStandard && this.model) {
-			try {
-				const keptMessages: AgentMessage[] = [];
-				const branch = this.sessionManager.getBranch();
-				const keptIdx = branch.findIndex((e) => e.id === preparation.firstKeptEntryId);
-				if (keptIdx >= 0) {
-					for (let i = keptIdx; i < branch.length; i++) {
-						keptMessages.push(...sessionEntryToContextMessages(branch[i]));
-					}
-				}
-				// Refresh the L1 contact tracker right before the checkpoint so the
-				// World State section reflects the freshest file state (external
-				// changes made during the session land in L2).
-				await this._fileContextTracker.refreshContacts();
-				const fileContext = this._fileContextTracker.snapshot();
-				const result = await compactStructured(
-					preparation,
-					this._previousCheckpoint(),
-					options.model,
-					options.customInstructions,
-					{
-						apiKey: options.apiKey,
-						headers: options.headers,
-						env: options.env,
-						signal: options.signal,
-						thinkingLevel: this.thinkingLevel,
-						streamFn: this.agent.streamFunction,
-						retry: this.settingsManager.getRetrySettings(),
-					},
-					keptMessages,
-					{
-						verifyPassText: this.uncertaintyStore.formatForVerifyPass(),
-						verifiedLines: this.uncertaintyStore.verifiedSectionLines(),
-					},
-					fileContext,
-				);
-				return {
-					summary: result.summary,
-					firstKeptEntryId: preparation.firstKeptEntryId,
-					tokensBefore: preparation.tokensBefore,
-					usage: result.usage,
-					details: {
-						...computeFileLists(preparation.fileOps),
-						contract: result.contract,
-						ledger: result.ledger,
-						version: 2,
-					} satisfies CompactionDetails,
-				};
-			} catch (err) {
-				console.error("Structured checkpoint failed, falling back to standard compaction:", err);
-			}
-		}
-		return compact(
-			preparation,
-			options.model,
-			options.apiKey,
-			options.headers,
-			options.customInstructions,
-			options.signal,
-			this.thinkingLevel,
-			this.agent.streamFunction,
-			options.env,
-			this.settingsManager.getRetrySettings(),
-			options.callbacks,
-		);
-	}
-
 	// =========================================================================
 	// Compaction
 	// =========================================================================
@@ -2440,7 +1964,7 @@ export class AgentSession {
 	 *
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
-	async compact(customInstructions?: string): Promise<CompactionResult> {
+	async compact(customInstructions?: string): Promise<SessionCompactionResult> {
 		await this.abort();
 		if (this.isCompacting) {
 			// An auto compaction / branch summary may be mid-flight: cancel it and
@@ -2470,7 +1994,14 @@ export class AgentSession {
 			// fixed, so the updated todo state is summarized, not lost.
 
 			const pathEntries = this.sessionManager.getBranch();
-			const settings = this.settingsManager.getCompactionSettings();
+			// fork(pi-ex): the fork pipeline lives in the context extension, which
+			// computes its own round-based preparation. The core's preparation here
+			// follows upstream semantics (hook event + fallback default compaction).
+			const settings = {
+				enabled: this.settingsManager.getCompactionEnabled(),
+				reserveTokens: this.settingsManager.getCompactionReserveTokens(),
+				keepRecentTokens: this.settingsManager.getCompactionKeepRecentTokens(),
+			};
 
 			const preparation = prepareCompaction(pathEntries, settings);
 			if (!preparation) {
@@ -2505,11 +2036,6 @@ export class AgentSession {
 				}
 			}
 
-			// Auto-review: settle pending flags against the current context
-			// before summarizing, so the verify pass includes the rulings.
-			// Same path as auto compaction. Silent — a failure never blocks.
-			await this._runAutoReviewIfEnabled();
-
 			let summary: string;
 			let firstKeptEntryId: string;
 			let tokensBefore: number;
@@ -2524,16 +2050,21 @@ export class AgentSession {
 				usage = extensionCompaction.usage;
 				details = extensionCompaction.details;
 			} else {
-				// Generate compaction result
-				const result = await this._generateCompaction(preparation, {
-					model: requestModel,
-					customInstructions,
-					signal: this._compactionAbortController.signal,
+				// Generate compaction result (upstream default; the fork pipeline
+				// intercepts earlier via session_before_compact).
+				const result = await compact(
+					preparation,
+					requestModel,
 					apiKey,
 					headers,
+					customInstructions,
+					this._compactionAbortController.signal,
+					this.thinkingLevel,
+					this.agent.streamFunction,
 					env,
-					callbacks: this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" }),
-				});
+					this.settingsManager.getRetrySettings(),
+					this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" }),
+				);
 				summary = result.summary;
 				firstKeptEntryId = result.firstKeptEntryId;
 				tokensBefore = result.tokensBefore;
@@ -2543,13 +2074,6 @@ export class AgentSession {
 
 			if (this._compactionAbortController.signal.aborted) {
 				throw new Error("Compaction cancelled");
-			}
-
-			// Auto-review the summary's uncertain sections before it becomes
-			// permanent context (same path as auto compaction). Silent — a
-			// failure keeps the summary untouched and the user review intact.
-			if (this.settingsManager.getUncertaintyReviewAuto()) {
-				summary = await this._autoReviewSummary(summary);
 			}
 
 			const compactionEntryId = this.sessionManager.appendCompaction(
@@ -2580,7 +2104,7 @@ export class AgentSession {
 				});
 			}
 
-			const compactionResult: CompactionResult = {
+			const compactionResult: SessionCompactionResult = {
 				summary,
 				firstKeptEntryId,
 				tokensBefore,
@@ -2662,7 +2186,14 @@ export class AgentSession {
 	 * @returns Whether the post-run loop should call `agent.continue()` for overflow recovery or queued messages
 	 */
 	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
-		const settings = this.settingsManager.getCompactionSettings();
+		// fork(pi-ex): the fork pipeline lives in the context extension, which
+		// computes its own round-based preparation. The core's preparation here
+		// follows upstream semantics (hook event + fallback default compaction).
+		const settings = {
+			enabled: this.settingsManager.getCompactionEnabled(),
+			reserveTokens: this.settingsManager.getCompactionReserveTokens(),
+			keepRecentTokens: this.settingsManager.getCompactionKeepRecentTokens(),
+		};
 		if (!settings.enabled) return false;
 
 		// While the pre-compaction todo refresh turn is running, its reply must
@@ -2780,7 +2311,14 @@ export class AgentSession {
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
 		// Never run alongside a manual compaction or branch summarization.
 		if (this.isCompacting) return false;
-		const settings = this.settingsManager.getCompactionSettings();
+		// fork(pi-ex): the fork pipeline lives in the context extension, which
+		// computes its own round-based preparation. The core's preparation here
+		// follows upstream semantics (hook event + fallback default compaction).
+		const settings = {
+			enabled: this.settingsManager.getCompactionEnabled(),
+			reserveTokens: this.settingsManager.getCompactionReserveTokens(),
+			keepRecentTokens: this.settingsManager.getCompactionKeepRecentTokens(),
+		};
 		let started = false;
 		let fromExtension = false;
 
@@ -2864,11 +2402,6 @@ export class AgentSession {
 				}
 			}
 
-			// Auto-review: settle pending flags against the current context
-			// before summarizing, so the verify pass includes the rulings.
-			// Silent — a failure never blocks compaction.
-			await this._runAutoReviewIfEnabled();
-
 			let summary: string;
 			let firstKeptEntryId: string;
 			let tokensBefore: number;
@@ -2883,16 +2416,21 @@ export class AgentSession {
 				usage = extensionCompaction.usage;
 				details = extensionCompaction.details;
 			} else {
-				// Generate compaction result
-				const compactResult = await this._generateCompaction(preparation, {
-					model: requestModel,
-					signal: this._autoCompactionAbortController.signal,
+				// Generate compaction result (upstream default; the fork pipeline
+				// intercepts earlier via session_before_compact).
+				const compactResult = await compact(
+					preparation,
+					requestModel,
 					apiKey,
 					headers,
+					undefined,
+					this._autoCompactionAbortController.signal,
+					this.thinkingLevel,
+					this.agent.streamFunction,
 					env,
-					forceStandard: reason === "overflow",
-					callbacks: this._summarizationRetryCallbacks({ source: "compaction", reason }),
-				});
+					this.settingsManager.getRetrySettings(),
+					this._summarizationRetryCallbacks({ source: "compaction", reason }),
+				);
 				summary = compactResult.summary;
 				firstKeptEntryId = compactResult.firstKeptEntryId;
 				tokensBefore = compactResult.tokensBefore;
@@ -2917,15 +2455,6 @@ export class AgentSession {
 				return false;
 			}
 
-			// Auto-review the summary's uncertain sections (Model Inferences /
-			// Open Questions / External State) against the latest conversation
-			// before it becomes permanent context, so settled entries no longer
-			// surface as "unverified items" for the user. Silent — a failure
-			// keeps the summary untouched and the user review flow intact.
-			if (this.settingsManager.getUncertaintyReviewAuto()) {
-				summary = await this._autoReviewSummary(summary);
-			}
-
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
@@ -2947,7 +2476,7 @@ export class AgentSession {
 				});
 			}
 
-			const result: CompactionResult = {
+			const result: SessionCompactionResult = {
 				summary,
 				firstKeptEntryId,
 				tokensBefore,
@@ -3355,9 +2884,9 @@ export class AgentSession {
 					]),
 				)
 			: createAllToolDefinitions(this._cwd, {
-					read: { autoResizeImages, tracker: this._fileContextTracker },
-					edit: { tracker: this._fileContextTracker, fileHistory: this._fileHistory },
-					write: { tracker: this._fileContextTracker, fileHistory: this._fileHistory },
+					read: { autoResizeImages },
+					edit: { fileHistory: this._fileHistory },
+					write: { fileHistory: this._fileHistory },
 					bash: {
 						commandPrefix: shellCommandPrefix,
 						shellPath,

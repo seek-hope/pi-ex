@@ -35,7 +35,7 @@ describe("issue #7253: manual compaction during an active response", () => {
 
 		const harness = await createHarness({
 			models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
-			settings: { compaction: { enabled: true, reserveTokens: 999, keepRecentRounds: 1 } },
+			settings: { compaction: { enabled: true, reserveTokens: 999, keepRecentTokens: 2 } },
 			tools: [createNoopTool()],
 			extensionFactories: [
 				(pi) => {
@@ -52,7 +52,6 @@ describe("issue #7253: manual compaction during an active response", () => {
 		});
 		harnesses.push(harness);
 		harness.setResponses([
-			fauxAssistantMessage("warmup ok"),
 			fauxAssistantMessage(fauxToolCall("noop", {}), { stopReason: "toolUse" }),
 			async () => {
 				markSecondResponseStarted();
@@ -60,10 +59,6 @@ describe("issue #7253: manual compaction during an active response", () => {
 				return fauxAssistantMessage("second response");
 			},
 		]);
-
-		// Warmup round gives the compaction window something to summarize:
-		// keepRecentRounds: 1 keeps only the tool-calling round.
-		await harness.session.prompt("warmup");
 
 		const promptPromise = harness.session.prompt("Run the tool, then continue responding.");
 		await secondResponseStarted;

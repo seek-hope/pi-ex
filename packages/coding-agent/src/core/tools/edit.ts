@@ -7,8 +7,6 @@ import { renderDiff } from "../../modes/interactive/components/diff.ts";
 import type { Theme } from "../../modes/interactive/theme/theme.ts";
 import { getExperimentalToolSampling } from "../experimental.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
-import type { FileContextTracker } from "../file-context.ts";
-import { formatFileTime } from "../file-context.ts";
 import type { FileChangeHistory } from "../file-history.ts";
 import {
 	applyEditsToNormalizedContent,
@@ -113,8 +111,6 @@ const defaultEditOperations: EditOperations = {
 export interface EditToolOptions {
 	/** Custom operations for file editing. Default: local filesystem */
 	operations?: EditOperations;
-	/** Tracks file context currency for stale-edit detection. */
-	tracker?: FileContextTracker;
 	/** Records before/after content for /tree file rewind. */
 	fileHistory?: FileChangeHistory;
 }
@@ -324,7 +320,6 @@ export function createEditToolDefinition(
 	options?: EditToolOptions,
 ): ToolDefinition<typeof editSchema, EditToolDetails | undefined, EditRenderState> {
 	const ops = options?.operations ?? defaultEditOperations;
-	const tracker = options?.tracker;
 	const fileHistory = options?.fileHistory;
 	return {
 		name: "edit",
@@ -369,16 +364,6 @@ export function createEditToolDefinition(
 
 				throwIfAborted();
 
-				// No stale-context guard here by design: if the file changed since
-				// the model last saw it, the region match below either fails
-				// ("oldText not found" error — the model re-reads) or succeeds
-				// (the external change didn't affect this edit).
-				// The write tool keeps its own guard because a write is a full
-				// overwrite with no region matching — it would silently clobber
-				// external changes. If the model's recorded view is stale we still
-				// annotate the result so it knows its memory is out of date.
-				const staleNote = tracker?.isOutdated(absolutePath, rawContent);
-
 				// Strip BOM before matching. The model will not include an invisible BOM in oldText.
 				const { bom, text: content } = stripBom(rawContent);
 				const originalEnding = detectLineEnding(content);
@@ -392,29 +377,13 @@ export function createEditToolDefinition(
 
 				fileHistory?.record(absolutePath, rawContent, finalContent);
 
-				// Attach the file's last-modified time so the model can compare
-				// timestamps across read results and detect external changes.
-				let statMtime: number | undefined;
-				try {
-					statMtime = (await fsStat(absolutePath)).mtimeMs;
-				} catch {
-					/* stat failure is not fatal — skip the note */
-				}
-				tracker?.markEdited(absolutePath, finalContent, statMtime);
-
 				const diffResult = generateDiffString(baseContent, newContent);
 				const patch = generateUnifiedPatch(path, baseContent, newContent);
-				let modifiedNote = "";
-				if (statMtime !== undefined) modifiedNote = ` (modified ${formatFileTime(statMtime)})`;
 				return {
 					content: [
 						{
 							type: "text",
-							text:
-								`Successfully replaced ${edits.length} block(s) in ${path}.${modifiedNote}` +
-								(staleNote
-									? " This file changed since your last read; the edit applied to the current disk content."
-									: ""),
+							text: `Successfully replaced ${edits.length} block(s) in ${path}.`,
 						},
 					],
 					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },

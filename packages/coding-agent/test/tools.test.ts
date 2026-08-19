@@ -64,9 +64,6 @@ describe("Coding Agent Tools", () => {
 			const result = await readTool.execute("test-call-1", { path: testFile });
 
 			const output = getTextOutput(result);
-			// The metadata line carries the file's last-modified time; the content
-			// itself follows it unchanged.
-			expect(output).toMatch(/^\[modified \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}\]/);
 			expect(output).toContain(content);
 			// No truncation message since file fits within limits
 			expect(output).not.toContain("Use offset=");

@@ -65,8 +65,6 @@ import {
 	computeCacheWaste,
 	detectCacheMiss,
 } from "../../core/cache-stats.ts";
-import { dismissItems, parseUncertainItems } from "../../core/compaction/review.ts";
-import type { UncertainFlag } from "../../core/compaction/uncertainty.ts";
 import type {
 	AutocompleteProviderFactory,
 	EditorFactory,
@@ -118,7 +116,6 @@ import { AssistantMessageComponent } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
 import { BorderedLoader } from "./components/bordered-loader.ts";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.ts";
-import { CompactionReviewWidget } from "./components/compaction-review.ts";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.ts";
 import { CustomEditor } from "./components/custom-editor.ts";
 import { CustomEntryComponent } from "./components/custom-entry.ts";
@@ -154,12 +151,6 @@ import {
 import { ToolExecutionComponent } from "./components/tool-execution.ts";
 import { TreeSelectorComponent } from "./components/tree-selector.ts";
 import { TrustSelectorComponent } from "./components/trust-selector.ts";
-import {
-	type UncertaintyBrowseResult,
-	UncertaintyBrowseWidget,
-	type UncertaintyReviewResult,
-	UncertaintyReviewWidget,
-} from "./components/uncertainty-review.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.ts";
 import { editInExternalEditor } from "./external-editor.ts";
@@ -518,7 +509,6 @@ export class InteractiveMode {
 	// Messages queued while compaction is running
 	private compactionQueuedMessages: CompactionQueuedMessage[] = [];
 	// Pending post-compaction review (compactionEntryId, summary)
-	private pendingCompactionReview?: { entryId: string; summary: string };
 
 	// Shutdown state
 	private shutdownRequested = false;
@@ -1143,9 +1133,6 @@ export class InteractiveMode {
 		}
 
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
-
-		// Offer /review for an un-reviewed compaction from a previous run.
-		this.restorePendingCompactionReview(true);
 
 		// Process initial messages
 		if (initialMessage) {
@@ -3053,11 +3040,6 @@ export class InteractiveMode {
 				await this.handleCompactCommand(customInstructions);
 				return;
 			}
-			if (text === "/review") {
-				this.editor.setText("");
-				await this.handleReviewCommand();
-				return;
-			}
 			if (text === "/attach" || text.startsWith("/attach ")) {
 				this.editor.setText("");
 				await this.handleAttachCommand(text === "/attach" ? "" : text.slice(8).trim());
@@ -3378,12 +3360,6 @@ export class InteractiveMode {
 
 			case "agent_settled":
 				await this.checkShutdownRequested();
-				await this.maybeShowUncertaintyReview();
-				break;
-
-			case "uncertainty_override_request":
-				// The auto-review wants to overturn a user ruling — confirm first.
-				await this.confirmUserRulingOverride(event.proposal);
 				break;
 
 			case "compaction_start": {
@@ -3440,16 +3416,6 @@ export class InteractiveMode {
 						});
 					}
 					this.footer.invalidate();
-
-					// Check for uncertain items the user should review.
-					const uncertain = parseUncertainItems(event.result.summary);
-					if (uncertain.length > 0 && event.result.compactionEntryId) {
-						this.pendingCompactionReview = {
-							entryId: event.result.compactionEntryId,
-							summary: event.result.summary,
-						};
-						this.showStatus(`Compaction complete. ${uncertain.length} unverified items — /review to inspect`);
-					}
 				} else if (event.errorMessage) {
 					if (event.reason === "manual") {
 						this.showError(event.errorMessage);
@@ -5324,7 +5290,6 @@ export class InteractiveMode {
 				return result;
 			}
 			this.showStatus("Resumed session");
-			this.restorePendingCompactionReview(true);
 			return result;
 		} catch (error: unknown) {
 			if (error instanceof MissingSessionCwdError) {
@@ -5342,7 +5307,6 @@ export class InteractiveMode {
 					return result;
 				}
 				this.showStatus("Resumed session in current cwd");
-				this.restorePendingCompactionReview(true);
 				return result;
 			}
 			return this.handleFatalRuntimeError("Failed to resume session", error);
@@ -6254,250 +6218,6 @@ export class InteractiveMode {
 	 */
 	private getEditorKeyDisplay(action: Keybinding): string {
 		return keyDisplayText(action);
-	}
-
-	/**
-	 * Restore a pending compaction review from the latest compaction entry.
-	 * The reviewed flag and dismissed markers are persisted in the session
-	 * file, so /review keeps working across restarts.
-	 */
-	private restorePendingCompactionReview(notify = false): void {
-		if (this.pendingCompactionReview) return;
-		const entry = this.sessionManager.getLatestCompactionEntry();
-		if (!entry) return;
-		const details = entry.details as Record<string, unknown> | undefined;
-		if (details?.reviewedAt) return;
-		const uncertain = parseUncertainItems(entry.summary);
-		if (uncertain.length === 0) return;
-		this.pendingCompactionReview = { entryId: entry.id, summary: entry.summary };
-		if (notify) {
-			this.showStatus(`Compaction review pending: ${uncertain.length} unverified items — /review to inspect`);
-		}
-	}
-
-	/** Guard against overlapping uncertainty review popups. */
-	private uncertaintyReviewOpen = false;
-
-	/**
-	 * Incremental uncertainty review: when the agent settles (run fully idle)
-	 * and the model flagged unverified claims, prompt the user immediately
-	 * instead of letting them pile up until post-compaction review.
-	 */
-	private async maybeShowUncertaintyReview(): Promise<void> {
-		if (this.uncertaintyReviewOpen) return;
-		// Auto-review mode: the model settles flags itself; no user popup.
-		if (this.settingsManager.getUncertaintyReviewAuto()) return;
-		if (this.settingsManager.getUncertaintyReviewTiming() !== "incremental") return;
-		const store = this.session.uncertaintyStore;
-		const pending = store.pending();
-		if (pending.length === 0) return;
-		this.uncertaintyReviewOpen = true;
-		try {
-			await this.showUncertaintyReview(pending);
-		} finally {
-			this.uncertaintyReviewOpen = false;
-		}
-	}
-
-	/**
-	 * Confirmation popup for the auto-review overturning a user ruling:
-	 * Enter accepts the change, Esc keeps the original ruling. The answer
-	 * is handed back through the session so the awaiting review pass can
-	 * continue (300s budget, timeout keeps the ruling).
-	 */
-	private async confirmUserRulingOverride(proposal: {
-		flagId: string;
-		claim: string;
-		decision: "verified" | "dismissed" | "corrected";
-		correction?: string;
-	}): Promise<void> {
-		let accepted = false;
-		let closed = false;
-		await this.showExtensionCustom<void>(
-			(_tui, componentTheme, _kb, done) => {
-				const A = (s: string) => componentTheme.fg("accent", componentTheme.bold(s));
-				const M = (s: string) => componentTheme.fg("dim", s);
-				const G = (s: string) => componentTheme.fg("success", s);
-				const H = (s: string) => componentTheme.fg("warning", s);
-				const close = (ok: boolean) => {
-					if (closed) return;
-					closed = true;
-					accepted = ok;
-					done();
-				};
-				const rulingLabel =
-					proposal.decision === "verified"
-						? "verified (keep)"
-						: proposal.decision === "dismissed"
-							? "dismissed (drop)"
-							: `corrected → ${proposal.correction ?? ""}`;
-				return {
-					render: () => [
-						"",
-						A(" Ruling Change"),
-						M(" The auto-review proposes to overturn a ruling you made earlier:"),
-						` ${proposal.claim}`,
-						` ${G("→")} ${rulingLabel}`,
-						"",
-						` ${G("Enter")} ${M("accept change")}  ${H("Esc")} ${M("keep original")}`,
-						"",
-					],
-					handleInput: (data: string) => {
-						if (data === "\r") {
-							close(true);
-							return false;
-						}
-						if (data === "\x1b") {
-							close(false);
-							return false;
-						}
-						return true;
-					},
-					invalidate: () => {},
-				};
-			},
-			{ overlay: true },
-		);
-		this.controller.respondOverrideConfirmation(accepted);
-	}
-
-	/** Show the review popup for a batch of pending flags and apply the results. */
-	private async showUncertaintyReview(pending: UncertainFlag[]): Promise<void> {
-		const store = this.session.uncertaintyStore;
-		const max = this.settingsManager.getUncertaintyReviewMaxPerPrompt();
-		const batch = pending.slice(0, Math.max(1, max));
-		const widget = new UncertaintyReviewWidget(batch, pending.length - batch.length);
-		const result = await this.showExtensionCustom<UncertaintyReviewResult>(
-			(_tui, _componentTheme, _kb, done) => {
-				const control = widget.start(done);
-				return {
-					render: (w: number) => control.render(w),
-					handleInput: (data: string) => control.handleInput(data),
-					invalidate: () => control.invalidate(),
-				};
-			},
-			{ overlay: true },
-		);
-		const corrections: string[] = [];
-		let decidedCount = 0;
-		for (const [flagId, outcome] of result.decisions) {
-			if (store.decide(flagId, outcome.decision, outcome.correction)) {
-				decidedCount++;
-				if (outcome.decision === "corrected" && outcome.correction) {
-					const flag = batch.find((f) => f.id === flagId);
-					corrections.push(`- "${flag?.claim ?? flagId}" → 更正：${outcome.correction}`);
-				}
-			}
-		}
-		if (decidedCount > 0) {
-			const remaining = store.pending().length;
-			const suffix = remaining > 0 ? ` ${remaining} still pending.` : "";
-			this.showStatus(`Reviewed ${decidedCount} flagged claim(s).${suffix}`);
-		}
-		// Corrections steer the conversation back onto verified facts.
-		if (corrections.length > 0) {
-			await this.controller.followUp(
-				`用户审核了你标记的不确定条目，以下更正立即生效：\n${corrections.join("\n")}\n请按更正后的事实继续。`,
-			);
-		}
-	}
-
-	/** /review: unified review — un-reviewed compaction items, then pending flags, then decided flags. */
-	private async handleReviewCommand(): Promise<void> {
-		// 1. Un-reviewed compaction items (keep/abandon).
-		if (await this.handleCompactionReviewCommand()) return;
-
-		// 2. Pending uncertainty flags.
-		const store = this.session.uncertaintyStore;
-		const pending = store.pending();
-		if (pending.length > 0) {
-			await this.showUncertaintyReview(pending);
-			return;
-		}
-		// 3. Browse already-decided flags.
-		const decided = store.decisions();
-		if (decided.length === 0) {
-			this.showStatus("No flagged uncertainty claims in this session.");
-			return;
-		}
-		const widget = new UncertaintyBrowseWidget(decided);
-		const result = await this.showExtensionCustom<UncertaintyBrowseResult>(
-			(_tui, _componentTheme, _kb, done) => {
-				const control = widget.start(done);
-				return {
-					render: (w: number) => control.render(w),
-					handleInput: (data: string) => control.handleInput(data),
-					invalidate: () => control.invalidate(),
-				};
-			},
-			{ overlay: true },
-		);
-		for (const flagId of result.requeue) {
-			store.requeue(flagId, "re-queued via /review");
-		}
-		const corrections: string[] = [];
-		for (const [flagId, outcome] of result.overrides) {
-			if (store.overrideDecision(flagId, outcome.decision, outcome.correction)) {
-				if (outcome.decision === "corrected" && outcome.correction) {
-					const flag = decided.find((f) => f.flagId === flagId);
-					corrections.push(`- "${flag?.claim ?? flagId}" → 更正：${outcome.correction}`);
-				}
-			}
-		}
-		if (result.requeue.length > 0) {
-			this.showStatus(`${result.requeue.length} item(s) re-queued for review.`);
-		}
-		if (corrections.length > 0) {
-			await this.controller.followUp(
-				`用户更新了对不确定条目的审核结论，以下更正立即生效：\n${corrections.join("\n")}\n请按更正后的事实继续。`,
-			);
-		}
-	}
-
-	/** Compaction review (keep/abandon) for the pending un-reviewed summary. Returns true when handled. */
-	private async handleCompactionReviewCommand(): Promise<boolean> {
-		if (!this.pendingCompactionReview) {
-			// Lazy restore: covers session switches that bypassed the notify paths.
-			this.restorePendingCompactionReview();
-		}
-		if (!this.pendingCompactionReview) {
-			return false;
-		}
-
-		const { entryId, summary } = this.pendingCompactionReview;
-		const items = parseUncertainItems(summary);
-		if (items.length === 0) {
-			this.showStatus("No unverified items to review.");
-			this.session.sessionManager.markCompactionReviewed(entryId);
-			this.pendingCompactionReview = undefined;
-			return true;
-		}
-
-		const widget = new CompactionReviewWidget(items);
-		await this.showExtensionCustom<void>((_tui, _componentTheme, _kb, done) => {
-			const control = widget.start((result) => {
-				if (result.dismissedLines.size > 0) {
-					const newSummary = dismissItems(summary, result.dismissedLines);
-					this.session.sessionManager.updateCompactionSummary(entryId, newSummary);
-					this.showStatus(`Review complete. ${result.dismissedLines.size} item(s) dismissed.`);
-					// Rebuild chat to reflect updated summary.
-					this.chatContainer.clear();
-					this.rebuildChatFromMessages();
-				} else {
-					this.showStatus("Review complete. All items kept.");
-				}
-				// Persisted so the review is not offered again after a restart.
-				this.session.sessionManager.markCompactionReviewed(entryId);
-				this.pendingCompactionReview = undefined;
-				done();
-			});
-			return {
-				render: (w: number) => control.render(w),
-				handleInput: (data: string) => control.handleInput(data),
-				invalidate: () => control.invalidate(),
-			};
-		});
-		return true;
 	}
 
 	/**

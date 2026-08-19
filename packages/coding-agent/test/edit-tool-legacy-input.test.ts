@@ -87,9 +87,7 @@ describe("edit tool prepareArguments", () => {
 		expect(result.content).toEqual([
 			{
 				type: "text",
-				text: expect.stringMatching(
-					/^Successfully replaced 1 block\(s\) in legacy\.txt\. \(modified \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}\)$/,
-				),
+				text: "Successfully replaced 1 block(s) in legacy.txt.",
 			},
 		]);
 		expect(await readFile(filePath, "utf8")).toBe("after\n");

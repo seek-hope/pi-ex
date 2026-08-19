@@ -12,7 +12,7 @@ const INDIVIDUAL_BASE_URL = "https://api.individual.githubcopilot.com";
 const ENTERPRISE_BASE_URL = "https://api.enterprise.githubcopilot.com";
 
 function seedCompactableSession(harness: Harness): void {
-	harness.settingsManager.applyOverrides({ compaction: { keepRecentRounds: 1 } });
+	harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
 	const now = Date.now();
 	harness.sessionManager.appendMessage({
 		role: "user",
@@ -35,28 +35,6 @@ function seedCompactableSession(harness: Harness): void {
 		},
 	};
 	harness.sessionManager.appendMessage(assistant);
-	// Second round: with keepRecentRounds: 1 only the last round is kept, so
-	// the first round is what gets summarized.
-	harness.sessionManager.appendMessage({
-		role: "user",
-		content: [{ type: "text", text: "message to compact 2" }],
-		timestamp: now - 300,
-	});
-	const assistant2: AssistantMessage = {
-		...fauxAssistantMessage("assistant response to compact 2", { timestamp: now - 100 }),
-		api: model.api,
-		provider: model.provider,
-		model: model.id,
-		usage: {
-			input: 100,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 100,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-	};
-	harness.sessionManager.appendMessage(assistant2);
 	harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 }
 

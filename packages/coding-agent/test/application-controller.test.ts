@@ -58,7 +58,6 @@ interface FakeSession {
 	messages: unknown[];
 	state: unknown;
 	systemPrompt: string;
-	respondOverrideConfirmation: (accepted: boolean) => boolean;
 	getToolDefinition: (name: string) => unknown;
 	bindExtensions: (bindings: unknown) => Promise<void>;
 	// Bash execution and retry
@@ -193,10 +192,6 @@ function makeFakeSession(name: string): FakeSession {
 		messages: [],
 		state: { messages: [] },
 		systemPrompt: `${name}-system-prompt`,
-		respondOverrideConfirmation: (accepted) => {
-			record("respondOverrideConfirmation", String(accepted));
-			return true;
-		},
 		getToolDefinition: (toolName) => {
 			record("getToolDefinition", toolName);
 			return { name: toolName };
@@ -429,7 +424,6 @@ describe("ApplicationController", () => {
 		expect(controller.messages).toEqual([]);
 		expect(controller.state).toEqual({ messages: [] });
 		expect(controller.systemPrompt).toBe("a-system-prompt");
-		expect(controller.respondOverrideConfirmation(true)).toBe(true);
 		controller.getToolDefinition("read");
 		await controller.bindExtensions({ uiContext: undefined });
 
@@ -460,7 +454,6 @@ describe("ApplicationController", () => {
 		controller.exportToJsonl("/tmp/x.jsonl");
 
 		const calls = holder.current.calls;
-		expect(calls).toContain("respondOverrideConfirmation(true)");
 		expect(calls).toContain("getToolDefinition(read)");
 		expect(calls).toContain("bindExtensions(bindings)");
 		expect(calls).toContain("executeBash(ls,onChunk,opts)");

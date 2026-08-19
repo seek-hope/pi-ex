@@ -23,19 +23,12 @@ export {
 	type SessionStats,
 } from "./core/agent-session.ts";
 export { readStoredCredential } from "./core/auth-storage.ts";
-// Compaction (pi-ex fork pipeline)
+// pi-ex: extra exports consumed by the pi-extensions context extension
 export {
-	type CompactionResult,
-	type CutPointResult,
-	compact,
-	DEFAULT_COMPACTION_SETTINGS,
-	estimateTokens,
-	findCutPoint,
-	generateSummary,
-	generateSummaryWithUsage,
-	shouldCompact,
-} from "./core/compaction/fork.ts";
-export { serializeConversation } from "./core/compaction/fork-utils.ts";
+	type ContextUsageEstimate,
+	completeSummarization,
+	estimateContextTokens,
+} from "./core/compaction/compaction.ts";
 // Compaction
 export {
 	type BranchPreparation,
@@ -49,6 +42,12 @@ export {
 	getLastAssistantUsage,
 	prepareBranchEntries,
 } from "./core/compaction/index.ts";
+export {
+	computeFileLists,
+	createFileOps,
+	SUMMARIZATION_SYSTEM_PROMPT,
+	serializeConversation,
+} from "./core/compaction/utils.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./core/event-bus.ts";
 // Extension system
 export type {
@@ -158,6 +157,7 @@ export {
 	wrapRegisteredTool,
 	wrapRegisteredTools,
 } from "./core/extensions/index.ts";
+export type { FileContextSnapshot } from "./core/file-context.ts";
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
 // pi-ex fork host bridge (streamFn/settingsManager for fork extensions)

@@ -12,7 +12,7 @@
  */
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import type { ModelRuntime } from "./model-runtime.ts";
-import type { SessionManager } from "./session-manager.ts";
+import type { ReadonlySessionManager } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 
 export interface ForkHostHandle {
@@ -21,13 +21,13 @@ export interface ForkHostHandle {
 	modelRuntime: ModelRuntime;
 }
 
-const hosts = new WeakMap<SessionManager, ForkHostHandle>();
+const hosts = new WeakMap<ReadonlySessionManager, ForkHostHandle>();
 
-export function registerForkHost(sessionManager: SessionManager, handle: ForkHostHandle): void {
+export function registerForkHost(sessionManager: ReadonlySessionManager, handle: ForkHostHandle): void {
 	hosts.set(sessionManager, handle);
 }
 
-export function getForkHost(sessionManager: SessionManager): ForkHostHandle | undefined {
+export function getForkHost(sessionManager: ReadonlySessionManager): ForkHostHandle | undefined {
 	return hosts.get(sessionManager);
 }
 

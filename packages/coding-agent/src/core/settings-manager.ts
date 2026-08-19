@@ -13,6 +13,7 @@ export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
 	keepRecentRounds?: number; // default: 2 - keep the most recent N rounds (turns) unsummarized; the cut always lands on a round boundary
+	keepRecentTokens?: number; // default: 20000 - upstream fallback compaction path (no context extension loaded) keeps this many recent tokens
 	quality?: "standard" | "structured"; // default: "structured" - checkpoint format; "standard" is the legacy narrative summary
 	thresholdRatio?: number; // default: 0.9 - compact when context usage exceeds this fraction of the context window
 	uncertaintyReview?: {
@@ -946,6 +947,10 @@ export class SettingsManager {
 			keepRecentRounds: this.getCompactionKeepRecentRounds(),
 			thresholdRatio: this.getCompactionThresholdRatio(),
 		};
+	}
+
+	getCompactionKeepRecentTokens(): number {
+		return this.settings.compaction?.keepRecentTokens ?? 20000;
 	}
 
 	getCompactionThresholdRatio(): number {
