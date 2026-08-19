@@ -83,7 +83,6 @@ import type {
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
 import { shareSessionAsGist } from "../../core/gist.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
-import type { SshIntegration } from "../../core/integrations/ssh/index.ts";
 import type { SubagentIntegration } from "../../core/integrations/subagent/index.ts";
 import type { InteractionPort } from "../../core/interaction-port.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
@@ -3063,11 +3062,6 @@ export class InteractiveMode {
 			if (text === "/attach" || text.startsWith("/attach ")) {
 				this.editor.setText("");
 				await this.handleAttachCommand(text === "/attach" ? "" : text.slice(8).trim());
-				return;
-			}
-			if (text === "/ssh" || text.startsWith("/ssh ")) {
-				this.editor.setText("");
-				await this.handleSshCommand(text === "/ssh" ? "" : text.slice(5).trim());
 				return;
 			}
 			if (text === "/subagent") {
@@ -6552,15 +6546,6 @@ export class InteractiveMode {
 			this.ui.start();
 			this.ui.requestRender(true);
 		}
-	}
-
-	private async handleSshCommand(args: string): Promise<void> {
-		const ssh = this.controller.getIntegration<SshIntegration>("ssh");
-		if (!ssh) {
-			this.showWarning('SSH integration is disabled. Enable via "ssh": { "enabled": true }.');
-			return;
-		}
-		await ssh.handleCommand(args);
 	}
 
 	private handleHotkeysCommand(): void {

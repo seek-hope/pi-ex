@@ -6,8 +6,6 @@
  */
 
 import type { SettingsManager } from "../settings-manager.ts";
-import { ComputerUseIntegration, isComputerUseSupported } from "./computer-use/index.ts";
-import { SshIntegration } from "./ssh/index.ts";
 import { SubagentIntegration } from "./subagent/index.ts";
 import type { CoreIntegration, CoreIntegrationContext } from "./types.ts";
 
@@ -17,23 +15,7 @@ import type { CoreIntegration, CoreIntegrationContext } from "./types.ts";
  */
 export function getDefaultIntegrationToolNames(settingsManager: SettingsManager): string[] {
 	const names: string[] = [];
-	if (settingsManager.getSshEnabled()) {
-		names.push("ssh_exec", "ssh_status", "scp_to_remote", "scp_from_remote");
-	}
-	if (isComputerUseAvailable(settingsManager)) {
-		names.push(
-			"computer_screenshot",
-			"computer_move",
-			"computer_click",
-			"computer_click_at",
-			"computer_double_click",
-			"computer_type",
-			"computer_key",
-			"computer_scroll",
-			"computer_drag",
-			"computer_get_position",
-			"computer_get_screen_size",
-		);
+	if (false) {
 	}
 	if (settingsManager.getSubagentsEnabled()) {
 		names.push(
@@ -53,22 +35,10 @@ export function getDefaultIntegrationToolNames(settingsManager: SettingsManager)
 	return names;
 }
 
-/** Settings gate + platform support (Hyprland/Wayland with grim/ydotool/wtype/hyprctl). */
-function isComputerUseAvailable(settingsManager: SettingsManager): boolean {
-	if (!settingsManager.getComputerUseEnabled()) return false;
-	return isComputerUseSupported();
-}
-
 export class IntegrationManager {
 	private readonly integrations = new Map<string, CoreIntegration>();
 
 	constructor(ctx: CoreIntegrationContext) {
-		if (ctx.settingsManager.getSshEnabled()) {
-			this.integrations.set("ssh", new SshIntegration(ctx));
-		}
-		if (isComputerUseAvailable(ctx.settingsManager)) {
-			this.integrations.set("computer-use", new ComputerUseIntegration(ctx));
-		}
 		if (ctx.settingsManager.getSubagentsEnabled()) {
 			this.integrations.set("subagent", new SubagentIntegration(ctx));
 		}
