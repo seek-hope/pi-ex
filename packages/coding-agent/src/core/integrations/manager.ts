@@ -10,7 +10,6 @@ import { BackgroundTasksIntegration } from "./bg-tasks/index.ts";
 import { ComputerUseIntegration, isComputerUseSupported } from "./computer-use/index.ts";
 import { SshIntegration } from "./ssh/index.ts";
 import { SubagentIntegration } from "./subagent/index.ts";
-import { TodoIntegration } from "./todo/index.ts";
 import type { CoreIntegration, CoreIntegrationContext } from "./types.ts";
 
 /**
@@ -20,7 +19,6 @@ import type { CoreIntegration, CoreIntegrationContext } from "./types.ts";
 export function getDefaultIntegrationToolNames(settingsManager: SettingsManager): string[] {
 	const names: string[] = [];
 	if (settingsManager.getTodoEnabled()) {
-		names.push("todo_write");
 	}
 	if (settingsManager.getBackgroundTasksEnabled()) {
 		names.push("bg_spawn", "bg_status", "bg_output", "bg_kill");
@@ -72,7 +70,6 @@ export class IntegrationManager {
 
 	constructor(ctx: CoreIntegrationContext) {
 		if (ctx.settingsManager.getTodoEnabled()) {
-			this.integrations.set("todo", new TodoIntegration(ctx));
 		}
 		if (ctx.settingsManager.getBackgroundTasksEnabled()) {
 			this.integrations.set("bg-tasks", new BackgroundTasksIntegration(ctx));

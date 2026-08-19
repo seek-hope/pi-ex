@@ -86,7 +86,6 @@ import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/htt
 import type { BackgroundTasksIntegration } from "../../core/integrations/bg-tasks/index.ts";
 import type { SshIntegration } from "../../core/integrations/ssh/index.ts";
 import type { SubagentIntegration } from "../../core/integrations/subagent/index.ts";
-import type { TodoIntegration } from "../../core/integrations/todo/index.ts";
 import type { InteractionPort } from "../../core/interaction-port.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
 import { createCompactionSummaryMessage } from "../../core/messages.ts";
@@ -2846,8 +2845,6 @@ export class InteractiveMode {
 		// Set up handlers on defaultEditor - they use this.editor for text access
 		// so they work correctly regardless of which editor is active
 		this.defaultEditor.onEscape = () => {
-			// An open todo detail page closes on Esc (instead of paging /todo to the end).
-			if (this.controller.getIntegration<TodoIntegration>("todo")?.closeDetailWidget()) return;
 			if (this.controller.isStreaming) {
 				this.restoreQueuedMessagesToEditor({ abort: true });
 			} else if (this.controller.isBashRunning) {
@@ -3059,11 +3056,6 @@ export class InteractiveMode {
 				const customInstructions = text.startsWith("/compact ") ? text.slice(9).trim() : undefined;
 				this.editor.setText("");
 				await this.handleCompactCommand(customInstructions);
-				return;
-			}
-			if (text === "/todo") {
-				this.editor.setText("");
-				this.controller.getIntegration<TodoIntegration>("todo")?.toggleDetailWidget();
 				return;
 			}
 			if (text === "/review") {

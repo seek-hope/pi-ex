@@ -21,7 +21,16 @@ import {
 	type SubagentRunResult,
 } from "@earendil-works/pi-subagent-core";
 import { Type } from "typebox";
-import type { TodoIntegration } from "../todo/index.ts";
+/** Structural view of the todo integration (lives in the fork-todo extension). */
+interface TodoIntegrationLike {
+	store: {
+		setProgress(key: string, status: string, content: string): void;
+		clearProgress(key: string): void;
+		addItem(content: string): string | null;
+		updateItemById(id: string, status: string, label?: string): void;
+		removeItemById(id: string): void;
+	};
+}
 import type { CoreIntegrationContext } from "../types.ts";
 import { runSubagent } from "./runner.ts";
 import type { SpawnSubagentOptions } from "./types.ts";
@@ -75,8 +84,8 @@ export class SubagentManager extends CoreSubagentManager {
 		return model ? { provider: model.provider, id: model.id } : undefined;
 	}
 
-	private todo(): TodoIntegration | undefined {
-		return this.ctx.getIntegration("todo");
+	private todo(): TodoIntegrationLike | undefined {
+		return this.ctx.getIntegration("todo") as TodoIntegrationLike | undefined;
 	}
 
 	protected override async runSubagent(request: SubagentRunRequest): Promise<SubagentRunResult> {

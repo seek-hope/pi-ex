@@ -345,35 +345,9 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
  */
 const MAX_AGENT_RUN_CONTINUATIONS = 30;
 
-/**
- * User-role reminder sent to the model right before a compaction when the
- * todo list has unfinished model-owned items: refresh the todo first so the
- * freshest state lands inside the compaction window (and the summary).
- */
-const TODO_COMPACTION_REMINDER = `[system-reminder] Session compaction is about to start: the conversation will be summarized and older messages discarded. Update your todo list to reflect the current state of the work before that happens:
-- Mark items you completed as completed.
-- Keep unfinished items (reword them if the plan changed).
-- Cancel items that are no longer relevant.
-Then end your turn — compaction continues automatically.`;
-
-/** Output budget for the pre-compaction todo refresh turn — it only rewrites the todo list. */
-const TODO_REFRESH_MAX_TOKENS = 4096;
-
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
 
-/**
- * Minimum structural shape of the todo integration this module relies on, so
- * the pre-compaction refresh and stale-todo warning don't depend on the
- * concrete TodoIntegration type.
- */
-interface TodoCompactionIntegration extends CoreIntegration {
-	setTurnIndex?(turnIndex: number): void;
-	getStaleWarning?(gap?: number): string | null;
-	store?: {
-		getModelItems(): { content: string; status: string }[];
-	};
-}
 
 // ============================================================================
 // AgentSession Class
@@ -424,11 +398,6 @@ export class AgentSession {
 	 * user input = one turn, so "stale for N turns" means N inputs from the
 	 * user, not N assistant/tool rounds. Machine-delivered prompts
 	 * (source "extension": monitor results, bg-task completions) do not count. */
-	private _userPromptCount = 0;
-	/** True while the pre-compaction todo refresh turn is running. */
-	private _todoRefreshActive = false;
-	/** Suppress compaction checks while the todo refresh turn is running. */
-	private _suppressCompactionCheck = false;
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
@@ -1835,7 +1804,6 @@ export class AgentSession {
 		}
 
 		preflightResult?.(true);
-		this._maybeWarnStaleTodos(options?.source);
 		this._maybeWarnStaleFiles();
 		await this._runAgentPrompt(messages);
 	}
@@ -1885,93 +1853,6 @@ export class AgentSession {
 		}
 	}
 
-	/**
-	 * If the todo list has unfinished model-owned items, run one extra model
-	 * turn asking it to refresh the todo (mark completed items, keep the rest)
-	 * BEFORE compaction. The refresh turn's messages land inside the compaction
-	 * window, so the freshest todo state is captured by the summary.
-	 *
-	 * Manual and auto compaction both call this right before
-	 * prepareCompaction(). Never throws — a failed refresh degrades to plain
-	 * compaction. Nested calls (the refresh reply triggering an auto-compact
-	 * check) are guarded by {@link _todoRefreshActive}, and the refresh reply
-	 * itself is excluded from compaction checks via {@link _suppressCompactionCheck}.
-	 */
-	private async _updateTodoBeforeCompaction(): Promise<void> {
-		if (this._todoRefreshActive) return;
-		const todo = this.getIntegration<TodoCompactionIntegration>("todo");
-		const items = todo?.store?.getModelItems();
-		if (!items || items.length === 0 || !items.some((i) => i.status !== "completed")) {
-			return;
-		}
-
-		// The refresh turn is a full-context request. Without an output cap it
-		// reserves the remaining window as maxTokens (window − estimate − 4096),
-		// i.e. the request occupies ~99.5% of the window at 70% usage — any
-		// tokenizer-vs-estimate error then surfaces as a context-overflow error
-		// right after compaction starts. Cap the output (the refresh only
-		// rewrites the todo list) and skip the refresh when even that would not
-		// fit; overflow compaction still recovers without it.
-		const model = this.model;
-		if (model && model.contextWindow > 0) {
-			const estimatedTokens =
-				estimateContextTokens(this.agent.state.messages).tokens + estimateTextTokens(TODO_COMPACTION_REMINDER);
-			if (estimatedTokens + TODO_REFRESH_MAX_TOKENS + 4096 > model.contextWindow) {
-				console.error(
-					"Skipping pre-compaction todo refresh: the request would not fit the model's context window.",
-				);
-				return;
-			}
-		}
-
-		this._todoRefreshActive = true;
-		this._suppressCompactionCheck = true;
-		const originalStreamFn = this.agent.streamFunction;
-		this.agent.streamFunction = (m, ctx, options) =>
-			originalStreamFn(m, ctx, { ...options, maxTokens: TODO_REFRESH_MAX_TOKENS });
-		try {
-			await this._runAgentPrompt([
-				{
-					role: "user",
-					content: [{ type: "text", text: TODO_COMPACTION_REMINDER }],
-					timestamp: Date.now(),
-				},
-			]);
-		} catch (err) {
-			console.error("Todo refresh before compaction failed (continuing with compaction):", err);
-		} finally {
-			this.agent.streamFunction = originalStreamFn;
-			this._suppressCompactionCheck = false;
-			this._todoRefreshActive = false;
-		}
-	}
-
-	/** Check for stale todo items and inject a steering reminder. */
-	private _maybeWarnStaleTodos(source?: InputSource): void {
-		try {
-			const todo = this.getIntegration<TodoCompactionIntegration>("todo");
-			if (!todo?.setTurnIndex || !todo?.getStaleWarning) return;
-			// Count user-initiated prompts only; machine follow-ups are not
-			// user input and must not advance the staleness clock.
-			if (source !== "extension") this._userPromptCount++;
-			todo.setTurnIndex(this._userPromptCount);
-			const warning = todo.getStaleWarning();
-			if (warning) {
-				// Mirror into the UI queue AND actually deliver to the agent.
-				// Without agent.steer() the message sat in the steering queue
-				// forever — visible but never sent.
-				this._steeringMessages.push(warning);
-				this._emitQueueUpdate();
-				this.agent.steer({
-					role: "user",
-					content: [{ type: "text", text: warning }],
-					timestamp: Date.now(),
-				});
-			}
-		} catch {
-			/* non-critical */
-		}
-	}
 
 	/**
 	 * Try to execute an extension command. Returns true if command was found and executed.
@@ -2622,7 +2503,6 @@ export class AgentSession {
 
 			// Refresh the todo (one model turn) before the compaction window is
 			// fixed, so the updated todo state is summarized, not lost.
-			await this._updateTodoBeforeCompaction();
 
 			const pathEntries = this.sessionManager.getBranch();
 			const settings = this.settingsManager.getCompactionSettings();
@@ -2822,7 +2702,6 @@ export class AgentSession {
 
 		// While the pre-compaction todo refresh turn is running, its reply must
 		// not itself trigger compaction — the caller is already compacting.
-		if (this._suppressCompactionCheck) return false;
 
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
 		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return false;
@@ -2958,7 +2837,6 @@ export class AgentSession {
 			// call and letting an error/length message pollute the upcoming summary
 			// window. Threshold and manual compaction keep the refresh.
 			if (reason !== "overflow") {
-				await this._updateTodoBeforeCompaction();
 			}
 
 			// Re-check after the (possibly long, awaited) refresh turn: a concurrent
