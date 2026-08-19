@@ -22,7 +22,6 @@ import { formatTimeout, type TimeoutInput, TimeoutParamSchema, timeoutToMs } fro
 import { checkBashGate, classifyBashGateCommand, formatGateResponse } from "../bash-gate.ts";
 import { getExperimentalToolSampling } from "../experimental.ts";
 import type { ExtensionContext, ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
-import { findOversizedSleep } from "../integrations/bg-tasks/index.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
 import { getTextOutput, invalidArgText, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -939,6 +938,29 @@ export function createBashTool(cwd: string, options?: BashToolOptions): AgentToo
 		promptGuidelines: definition.promptGuidelines,
 	});
 	return tool;
+}
+
+const MAX_BG_SLEEP_SECONDS = 12 * 3600;
+
+/**
+ * Find sleep invocations exceeding MAX_BG_SLEEP_SECONDS in a task command.
+ * fork(pi-ex): local copy — the canonical one lives in the bg-tasks
+ * extension (both are stable; keep the regex in sync).
+ */
+function findOversizedSleep(command: string): { value: number; unit: string; seconds: number } | undefined {
+	const re = /(?:^|[;\n&|]|\bdo\s+|\bthen\s+|\belse\s+)\s*sleep\s+(\d+(?:\.\d+)?)([smhd]?)\b/g;
+	let match = re.exec(command);
+	while (match) {
+		const value = Number.parseFloat(match[1]);
+		const unit = match[2] || "s";
+		const factor = unit === "d" ? 86400 : unit === "h" ? 3600 : unit === "m" ? 60 : 1;
+		const seconds = value * factor;
+		if (seconds > MAX_BG_SLEEP_SECONDS) {
+			return { value, unit: unit || "s", seconds };
+		}
+		match = re.exec(command);
+	}
+	return undefined;
 }
 
 /**

@@ -28,3 +28,26 @@ export function registerForkHost(sessionManager: SessionManager, handle: ForkHos
 export function getForkHost(sessionManager: SessionManager): ForkHostHandle | undefined {
 	return hosts.get(sessionManager);
 }
+
+// ── Extension-registered services ────────────────────────────────────────────
+// Core wiring points that need an extension-provided implementation. The
+// extension registers at load time; core call sites read at execution time.
+
+export type BgSpawner = (
+	task: string,
+	cwd: string,
+	timeoutMs: number,
+	sessionId: string,
+	label?: string,
+) => Promise<{ id: string; logFile: string }>;
+
+let bgSpawner: BgSpawner | undefined;
+
+/** Called by the bg-tasks extension at load time. */
+export function setBgSpawner(spawner: BgSpawner): void {
+	bgSpawner = spawner;
+}
+
+export function getBgSpawner(): BgSpawner | undefined {
+	return bgSpawner;
+}

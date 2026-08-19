@@ -21,6 +21,7 @@ import {
 	type SubagentRunResult,
 } from "@earendil-works/pi-subagent-core";
 import { Type } from "typebox";
+
 /** Structural view of the todo integration (lives in the fork-todo extension). */
 interface TodoIntegrationLike {
 	store: {
@@ -31,6 +32,7 @@ interface TodoIntegrationLike {
 		removeItemById(id: string): void;
 	};
 }
+
 import type { CoreIntegrationContext } from "../types.ts";
 import { runSubagent } from "./runner.ts";
 import type { SpawnSubagentOptions } from "./types.ts";

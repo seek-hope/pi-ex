@@ -83,7 +83,6 @@ import type {
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
 import { shareSessionAsGist } from "../../core/gist.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
-import type { BackgroundTasksIntegration } from "../../core/integrations/bg-tasks/index.ts";
 import type { SshIntegration } from "../../core/integrations/ssh/index.ts";
 import type { SubagentIntegration } from "../../core/integrations/subagent/index.ts";
 import type { InteractionPort } from "../../core/interaction-port.ts";
@@ -119,7 +118,6 @@ import { checkForNewPiVersion, type LatestPiRelease } from "../../utils/version-
 import { ArminComponent } from "./components/armin.ts";
 import { AssistantMessageComponent } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
-import { BgTasksWidget } from "./components/bg-tasks-widget.ts";
 import { BorderedLoader } from "./components/bordered-loader.ts";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.ts";
 import { CompactionReviewWidget } from "./components/compaction-review.ts";
@@ -2885,7 +2883,6 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
-		this.defaultEditor.onAction("app.bg.tasks.manage", () => this.toggleBgTaskManager());
 		this.defaultEditor.onAction("app.editor.external", () => void this.handleOpenExternalEditor());
 		this.defaultEditor.onAction("app.message.copy", () => void this.handleCopyCommand({ flashConfirmation: true }));
 		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
@@ -3061,21 +3058,6 @@ export class InteractiveMode {
 			if (text === "/review") {
 				this.editor.setText("");
 				await this.handleReviewCommand();
-				return;
-			}
-			if (text === "/tasks") {
-				this.editor.setText("");
-				this.toggleBgTaskManager();
-				return;
-			}
-			if (text === "/fg" || text.startsWith("/fg ")) {
-				this.editor.setText("");
-				await this.handleFgCommand(text === "/fg" ? "" : text.slice(4).trim());
-				return;
-			}
-			if (text === "/kill" || text.startsWith("/kill ")) {
-				this.editor.setText("");
-				await this.handleKillCommand(text === "/kill" ? "" : text.slice(6).trim());
 				return;
 			}
 			if (text === "/attach" || text.startsWith("/attach ")) {
@@ -6291,10 +6273,6 @@ export class InteractiveMode {
 		return keyDisplayText(action);
 	}
 
-	private bgTasks(): BackgroundTasksIntegration | undefined {
-		return this.controller.getIntegration<BackgroundTasksIntegration>("bg-tasks");
-	}
-
 	/**
 	 * Restore a pending compaction review from the latest compaction entry.
 	 * The reviewed flag and dismissed markers are persisted in the session
@@ -6544,174 +6522,22 @@ export class InteractiveMode {
 	 * k kill, Esc back). Mounted by /tasks and removed when closed — it never
 	 * lingers on screen after Esc.
 	 */
-	private _bgTasksWidget: BgTasksWidget | undefined;
-	/** Key of the currently shown /fg task-output widget (only one at a time). */
-	private lastTaskWidgetKey: string | undefined;
-
-	/** Remove the task-manager widget (and any preview) and return focus to the editor. */
-	private closeBgTaskManager(): void {
-		this._bgTasksWidget?.dispose();
-		this.setExtensionWidget("bg-tasks", undefined);
-		this.setExtensionWidget("task-preview", undefined);
-		this._bgTasksWidget = undefined;
-		this.ui.setFocus(this.editor);
-	}
-
-	private toggleBgTaskManager(): void {
-		const bg = this.bgTasks();
-		if (!bg) {
-			this.showWarning('Background tasks are disabled. Enable via "backgroundTasks": { "enabled": true }.');
-			return;
-		}
-		const focused = this._bgTasksWidget?.focused === true;
-		if (focused || this._bgTasksWidget) {
-			this.closeBgTaskManager();
-			this.showStatus("Background task manager closed.");
-			return;
-		}
-		this._bgTasksWidget = new BgTasksWidget({
-			getTasks: () =>
-				[...bg.store.list()].sort((a, b) => {
-					const ar = a.status === "running" ? 1 : 0;
-					const br = b.status === "running" ? 1 : 0;
-					if (ar !== br) return br - ar;
-					return (b.startTime ?? 0) - (a.startTime ?? 0);
-				}),
-			onView: (id) => void this.showTaskPreview(id),
-			onBackFromView: () => this.setExtensionWidget("task-preview", undefined),
-			onKill: (id) => bg.killTask(id),
-			onExit: () => {
-				this.closeBgTaskManager();
-				this.showStatus("Background task manager closed.");
-			},
-			height: InteractiveMode.maxWidgetLines(),
-		});
-		this.setExtensionWidget("bg-tasks", () => this._bgTasksWidget!);
-		this.ui.setFocus(this._bgTasksWidget);
-		this._bgTasksWidget.refresh();
-		this.ui.requestRender();
-	}
-
-	/**
-	 * Preview panel for the task manager: the task's latest 5 output lines.
-	 * Dismissed by Esc (back to the task list) — never lingers.
-	 * Only running tasks are viewable; finished tasks were already delivered
-	 * with their completion notice and their records are reaped.
-	 */
-	private async showTaskPreview(id: string): Promise<void> {
-		const bg = this.bgTasks();
-		if (!bg) {
-			this.showWarning('Background tasks are disabled. Enable via "backgroundTasks": { "enabled": true }.');
-			return;
-		}
-		const task = bg.store.get(id);
-		if (!task) {
-			this.showError(`Task ${id} not found.`);
-			return;
-		}
-		if (task.status !== "running") {
-			this.showError(
-				`Task ${id} has finished (${task.status}) — its output was delivered with the completion notice.`,
-			);
-			return;
-		}
-		const result = await bg.taskOutput(id);
-		if (!result) {
-			this.showError(`Task ${id} not found.`);
-			return;
-		}
-		const { task: t, output } = result;
-		const lines = output.split("\n").slice(-5);
-		const maxLine = Math.max(this.ui.terminal.columns - 4, 20);
-		this.setExtensionWidget("task-preview", [
-			`┌─ ${id} [${t.status}]${t.exitCode != null ? ` exit=${t.exitCode}` : ""}`,
-			...(t.label ? [`│ ${t.label}`] : []),
-			...lines.map((l: string) => `│ ${l.substring(0, maxLine)}`),
-			`│ Esc back to tasks  |  /fg ${id} for full output`,
-			"└─",
-		]);
-	}
-
-	private async handleFgCommand(id: string): Promise<void> {
-		const bg = this.bgTasks();
-		if (!bg) {
-			this.showWarning('Background tasks are disabled. Enable via "backgroundTasks": { "enabled": true }.');
-			return;
-		}
-		const full = id.includes("--full");
-		id = id.replace(/\s*--full\s*/, "").trim();
-		if (!id) {
-			this.showWarning("Usage: /fg <task-id> [--full]");
-			return;
-		}
-		const task = bg.store.get(id);
-		if (!task) {
-			this.showError(`Task ${id} not found.`);
-			return;
-		}
-		if (task.status !== "running") {
-			this.showError(
-				`Task ${id} has finished (${task.status}) — its output was already delivered with the completion notice and the task record is reaped. Use /tasks for running tasks.`,
-			);
-			return;
-		}
-		const result = await bg.taskOutput(id);
-		if (!result) {
-			this.showError(`Task ${id} not found.`);
-			return;
-		}
-		const { task: t, output } = result;
-		const lines = output.split("\n");
-		const shown = full ? lines : lines.slice(-50);
-		const hidden = lines.length - shown.length;
-		const maxLine = Math.max(this.ui.terminal.columns - 4, 20);
-		// Only one task-output widget at a time — clear the previous one.
-		if (this.lastTaskWidgetKey && this.lastTaskWidgetKey !== `task-${id}`) {
-			this.setExtensionWidget(this.lastTaskWidgetKey, undefined);
-		}
-		this.lastTaskWidgetKey = `task-${id}`;
-		this.setExtensionWidget(
-			`task-${id}`,
-			[
-				`┌─ ${id} [${t.status}]${t.exitCode != null ? ` exit=${t.exitCode}` : ""}`,
-				`│ $ ${t.description}`, // full command, never truncated
-				...(full ? shown.map((l: string) => `│ ${l}`) : shown.map((l: string) => `│ ${l.substring(0, maxLine)}`)),
-				!full && hidden > 0 ? `│ ... (${hidden} earlier lines hidden, use /fg ${id} --full)` : "",
-				`│ log: ${t.logFile}`,
-				"└─",
-			].filter(Boolean),
-		);
-	}
-
-	private async handleKillCommand(id: string): Promise<void> {
-		const bg = this.bgTasks();
-		if (!bg) {
-			this.showWarning('Background tasks are disabled. Enable via "backgroundTasks": { "enabled": true }.');
-			return;
-		}
-		if (!id) {
-			this.showWarning("Usage: /kill <task-id>");
-			return;
-		}
-		if (await bg.killTask(id)) {
-			this.showStatus(`Killed ${id}.`);
-		} else {
-			this.showError(`Task ${id} not found.`);
-		}
-	}
-
 	private async handleAttachCommand(id: string): Promise<void> {
-		const bg = this.bgTasks();
-		if (!bg) {
-			this.showWarning('Background tasks are disabled. Enable via "backgroundTasks": { "enabled": true }.');
-			return;
-		}
+		// fork(pi-ex): bg-tasks moved to the extension; /attach stays in core
+		// because extensions cannot suspend the TUI. Reads the shared store file.
 		if (!id) {
 			this.showWarning("Usage: /attach <task-id>");
 			return;
 		}
-		const task = bg.store.get(id);
-		if (!task || task.status !== "running") {
+		try {
+			const storeFile = path.join(getAgentDir(), "tasks", "tasks.json");
+			const tasks = JSON.parse(fs.readFileSync(storeFile, "utf-8")) as Array<{ id: string; status: string }>;
+			const task = tasks.find((t) => t.id === id);
+			if (!task || task.status !== "running") {
+				this.showError(`Task ${id} is not running.`);
+				return;
+			}
+		} catch {
 			this.showError(`Task ${id} is not running.`);
 			return;
 		}

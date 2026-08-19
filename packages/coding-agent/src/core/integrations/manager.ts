@@ -6,7 +6,6 @@
  */
 
 import type { SettingsManager } from "../settings-manager.ts";
-import { BackgroundTasksIntegration } from "./bg-tasks/index.ts";
 import { ComputerUseIntegration, isComputerUseSupported } from "./computer-use/index.ts";
 import { SshIntegration } from "./ssh/index.ts";
 import { SubagentIntegration } from "./subagent/index.ts";
@@ -18,11 +17,6 @@ import type { CoreIntegration, CoreIntegrationContext } from "./types.ts";
  */
 export function getDefaultIntegrationToolNames(settingsManager: SettingsManager): string[] {
 	const names: string[] = [];
-	if (settingsManager.getTodoEnabled()) {
-	}
-	if (settingsManager.getBackgroundTasksEnabled()) {
-		names.push("bg_spawn", "bg_status", "bg_output", "bg_kill");
-	}
 	if (settingsManager.getSshEnabled()) {
 		names.push("ssh_exec", "ssh_status", "scp_to_remote", "scp_from_remote");
 	}
@@ -69,11 +63,6 @@ export class IntegrationManager {
 	private readonly integrations = new Map<string, CoreIntegration>();
 
 	constructor(ctx: CoreIntegrationContext) {
-		if (ctx.settingsManager.getTodoEnabled()) {
-		}
-		if (ctx.settingsManager.getBackgroundTasksEnabled()) {
-			this.integrations.set("bg-tasks", new BackgroundTasksIntegration(ctx));
-		}
 		if (ctx.settingsManager.getSshEnabled()) {
 			this.integrations.set("ssh", new SshIntegration(ctx));
 		}

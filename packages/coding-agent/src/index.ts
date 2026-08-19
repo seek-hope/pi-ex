@@ -161,7 +161,14 @@ export {
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
 // pi-ex fork host bridge (streamFn/settingsManager for fork extensions)
-export { type ForkHostHandle, getForkHost, registerForkHost } from "./core/fork-host.ts";
+export {
+	type BgSpawner,
+	type ForkHostHandle,
+	getBgSpawner,
+	getForkHost,
+	registerForkHost,
+	setBgSpawner,
+} from "./core/fork-host.ts";
 export { convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export {

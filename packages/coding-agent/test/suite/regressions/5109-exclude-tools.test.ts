@@ -63,16 +63,7 @@ describe("regression #5109: exclude tools", () => {
 			expect(allToolNames).toContain("bash");
 			expect(allToolNames).toContain("dynamic_tool");
 			// ask_user/wait moved to the fork-ask-wait extension (not loaded here).
-			expect(harness.session.getActiveToolNames().sort()).toEqual([
-				"bash",
-				"bg_kill",
-				"bg_output",
-				"bg_spawn",
-				"bg_status",
-				"dynamic_tool",
-				"edit",
-				"write",
-			]);
+			expect(harness.session.getActiveToolNames().sort()).toEqual(["bash", "dynamic_tool", "edit", "write"]);
 			expect(harness.session.systemPrompt).not.toContain("- read:");
 			expect(harness.session.systemPrompt).not.toContain("ask_question");
 			expect(harness.session.systemPrompt).toContain("- dynamic_tool: Run dynamic test behavior");

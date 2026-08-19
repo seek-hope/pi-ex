@@ -93,20 +93,7 @@ describe("regression #3592: no-builtin-tools keeps extension tools enabled", () 
 				.sort(),
 			// ask_user/wait moved to the fork-ask-wait extension (not loaded here);
 			// grep/find/ls are registered (upstream-pure registry) but not default-active.
-		).toEqual([
-			"bash",
-			"bg_kill",
-			"bg_output",
-			"bg_spawn",
-			"bg_status",
-			"dynamic_tool",
-			"edit",
-			"find",
-			"grep",
-			"ls",
-			"read",
-			"write",
-		]);
+		).toEqual(["bash", "dynamic_tool", "edit", "find", "grep", "ls", "read", "write"]);
 		expect(session.getActiveToolNames()).toEqual(["dynamic_tool"]);
 		expect(session.systemPrompt).toContain("- dynamic_tool: Run dynamic test behavior");
 		expect(session.systemPrompt).not.toContain("- read:");

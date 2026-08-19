@@ -117,8 +117,7 @@ import {
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import { FileContextTracker, formatFileTime } from "./file-context.ts";
 import { FileChangeHistory, type FileRevertResult } from "./file-history.ts";
-import { registerForkHost } from "./fork-host.ts";
-import type { BackgroundTasksIntegration } from "./integrations/bg-tasks/index.ts";
+import { getBgSpawner, registerForkHost } from "./fork-host.ts";
 import { IntegrationFollowUpBatcher } from "./integrations/followup-batcher.ts";
 import { IntegrationManager } from "./integrations/manager.ts";
 import type { CoreIntegration } from "./integrations/types.ts";
@@ -347,7 +346,6 @@ const MAX_AGENT_RUN_CONTINUATIONS = 30;
 
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
-
 
 // ============================================================================
 // AgentSession Class
@@ -1852,7 +1850,6 @@ export class AgentSession {
 			/* not a git repo — project-wide rotation unavailable */
 		}
 	}
-
 
 	/**
 	 * Try to execute an extension command. Returns true if command was found and executed.
@@ -3399,11 +3396,13 @@ export class AgentSession {
 						exposeProviderSecrets: this.settingsManager.getBashExposeProviderSecrets(),
 						sudo: this._localSudoHandler,
 						spawnBg: async (task, label) => {
-							const bg = this._integrationManager.get<BackgroundTasksIntegration>("bg-tasks");
-							if (!bg) {
+							// fork(pi-ex): the bg-tasks extension registers the spawner
+							// on the fork host bridge at load time.
+							const spawn = getBgSpawner();
+							if (!spawn) {
 								throw new Error("background tasks are unavailable");
 							}
-							const spawned = await bg.store.spawn(task, this._cwd, 12 * 3600 * 1000, this.sessionId, label);
+							const spawned = await spawn(task, this._cwd, 12 * 3600 * 1000, this.sessionId, label);
 							return { id: spawned.id, logFile: spawned.logFile };
 						},
 					},
