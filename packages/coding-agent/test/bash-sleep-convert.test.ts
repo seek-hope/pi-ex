@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { classifyBashGateCommand, parseSleepCommand } from "../src/core/bash-gate.ts";
 import { createBashTool } from "../src/core/tools/bash.ts";
-import type { WaitScheduleResult } from "../src/core/tools/wait.ts";
 
 describe("parseSleepCommand", () => {
 	it("parses plain durations", () => {
@@ -72,45 +71,6 @@ describe("classifyBashGateCommand", () => {
 });
 
 describe("bash tool sleep auto-conversion", () => {
-	function waitScheduler(results: WaitScheduleResult[]) {
-		return vi.fn(
-			(_seconds: number, _opts?: { clamp?: boolean }): WaitScheduleResult =>
-				results.shift() ?? { ok: false, error: "no more results" },
-		);
-	}
-
-	it("converts a pure sleep into a wait with terminate", async () => {
-		const schedule = waitScheduler([{ ok: true, message: "Waiting 60s." }]);
-		const tool = createBashTool("/tmp", { waitSchedule: schedule });
-		const result = await tool.execute("t1", { command: "sleep 60" });
-		expect(schedule).toHaveBeenCalledWith(60, { clamp: true });
-		expect(result.terminate).toBe(true);
-		expect(result.content[0]).toMatchObject({ type: "text", text: "Waiting 60s." });
-	});
-
-	it("passes through a clamped wait message", async () => {
-		const schedule = waitScheduler([
-			{ ok: true, message: "Waiting 120s (capped at 120s — the wait limit for this session)." },
-		]);
-		const tool = createBashTool("/tmp", { waitSchedule: schedule });
-		const result = await tool.execute("t1", { command: "sleep 1000" });
-		expect(schedule).toHaveBeenCalledWith(1000, { clamp: true });
-		expect(result.terminate).toBe(true);
-		expect(result.content[0]).toMatchObject({
-			type: "text",
-			text: "Waiting 120s (capped at 120s — the wait limit for this session).",
-		});
-	});
-
-	it("falls back to the gate response when the wait scheduler rejects", async () => {
-		const schedule = waitScheduler([
-			{ ok: false, error: "Headless wait limit reached: 5 waits per session. Continue without waiting." },
-		]);
-		const tool = createBashTool("/tmp", { waitSchedule: schedule });
-		const result = await tool.execute("t1", { command: "sleep 60" });
-		expect(result.content[0]).toMatchObject({ type: "text", text: expect.stringContaining("[BLOCKED]") });
-	});
-
 	it("converts a mixed sleep command into a background task", async () => {
 		const spawnBg = vi.fn(async (_task: string, _label?: string) => ({ id: "task-x1", logFile: "/tmp/task-x1.log" }));
 		const tool = createBashTool("/tmp", { spawnBg });

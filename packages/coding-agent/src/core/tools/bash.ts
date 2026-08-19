@@ -27,7 +27,6 @@ import { OutputAccumulator } from "./output-accumulator.ts";
 import { getTextOutput, invalidArgText, str } from "./render-utils.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.ts";
-import type { WaitScheduleResult } from "./wait.ts";
 
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Bash command to execute" }),
@@ -379,7 +378,6 @@ export interface BashToolOptions {
 	 * `sleep` command into a wait. When `clamp` is set, durations above the
 	 * session cap are truncated to the cap instead of rejected.
 	 */
-	waitSchedule?: (seconds: number, opts?: { clamp?: boolean }) => WaitScheduleResult;
 	/**
 	 * Start a background task (gate auto-conversion of sleep-containing
 	 * commands and polling loops). Returns the spawned task's id and log
@@ -960,19 +958,6 @@ async function autoConvertGatedCommand(
 	options: BashToolOptions,
 ): Promise<AgentToolResult<BashToolDetails | undefined> | undefined> {
 	const classification = classifyBashGateCommand(command, ruleName);
-	if (classification.kind === "wait") {
-		const result = options.waitSchedule?.(classification.seconds, { clamp: true });
-		if (!result?.ok) {
-			// Over the headless use cap or no scheduler: fall back to the gate
-			// response instead of silently running the sleep in the foreground.
-			return undefined;
-		}
-		return {
-			content: [{ type: "text", text: result.message }],
-			details: { convertedToWait: { seconds: classification.seconds } },
-			terminate: true,
-		};
-	}
 	if (classification.kind === "bg") {
 		if (!options.spawnBg) {
 			return undefined;

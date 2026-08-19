@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createAgentSessionFromServices, createAgentSessionServices } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 
-// Fork note: this fork's built-in registry is read/bash/edit/write/ask_user/wait
+// Fork note: this fork's built-in registry is read/bash/edit/write (ask_user/wait moved to the fork-ask-wait extension)
 // (plus integration tools), not upstream's read/bash/edit/write/grep/find/ls —
 // so the configured lists below use this fork's inventory, and the all-tools
 // assertions are containment checks instead of upstream's exact 7-tool list.
@@ -61,7 +61,7 @@ describe("defaultTools setting", () => {
 		const session = await createSession(["read", "bash"]);
 
 		expect(session.getAllTools().map((tool) => tool.name)).toEqual(
-			expect.arrayContaining(["read", "bash", "edit", "write", "ask_user", "wait"]),
+			expect.arrayContaining(["read", "bash", "edit", "write"]),
 		);
 		expect(session.getActiveToolNames()).toEqual(["read", "bash"]);
 		expect(session.systemPrompt).toContain("Read file contents");
@@ -140,7 +140,7 @@ describe("defaultTools setting", () => {
 		});
 
 		expect(session.getAllTools().map((tool) => tool.name)).toEqual(
-			expect.arrayContaining(["read", "bash", "edit", "write", "ask_user", "wait"]),
+			expect.arrayContaining(["read", "bash", "edit", "write"]),
 		);
 		expect(session.getActiveToolNames()).toEqual(["read"]);
 		session.dispose();

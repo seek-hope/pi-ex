@@ -138,12 +138,10 @@ import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
-import type { AskUserResult } from "./tools/ask-user.ts";
 import { type BashOperations, createLocalBashOperations, type LocalSudoHandler } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { extractChangedIdentifiers, runPostEditScan } from "./tools/post-edit-scan.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
-import type { WaitScheduleResult } from "./tools/wait.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
 import { WORK_LOOP_GUIDANCE } from "./work-loop-guidance.ts";
 
@@ -438,14 +436,6 @@ export class AgentSession {
 	private _fileContextTracker = new FileContextTracker();
 	private _fileHistory = new FileChangeHistory();
 
-	/** Pending wait wake-up timer (wait tool), cleared on user input / shutdown. */
-	private _waitTimer: NodeJS.Timeout | undefined;
-	/** Headless wait uses consumed (max 5 per session). */
-	private _headlessWaitCount = 0;
-	/** Wake-up message constants for the wait tool. */
-	private static readonly WAIT_WAKEUP_MESSAGE =
-		"The wait you requested has ended — resume your work where you left off.\n";
-
 	/** Sudo password for local bash (memory only, never persisted). */
 	private _sudoPassword: string | undefined;
 	private readonly _localSudoHandler: LocalSudoHandler = {
@@ -465,111 +455,6 @@ export class AgentSession {
 		},
 	};
 
-	/** Ask the user a clarifying question (masking NOT used — intent, not secrets). */
-	private readonly _askUserHandler = async (question: string): Promise<AskUserResult> => {
-		if (!this._extensionUIContext) {
-			return { ok: false, reason: "no-ui" };
-		}
-		const answer = await this._extensionUIContext.input(question);
-		if (answer === undefined || answer.trim() === "") {
-			return { ok: false, reason: "cancelled" };
-		}
-		return { ok: true, answer };
-	};
-
-	/** Cancel a pending wait wake-up (user input arrived, session shutting down). */
-	private _cancelPendingWait(): void {
-		if (this._waitTimer) {
-			clearTimeout(this._waitTimer);
-			this._waitTimer = undefined;
-		}
-	}
-
-	/**
-	 * Wait-tool scheduler: enforce caps, arm the wake-up timer, and produce
-	 * the model-facing message. Interactive: up to 12h. Headless (no UI): up
-	 * to 120s, 5 uses per session. With `clamp` (bash gate auto-conversion of
-	 * pure `sleep`), durations above the cap are truncated to it instead of
-	 * rejected.
-	 */
-	private _scheduleWait(seconds: number, opts?: { clamp?: boolean }): WaitScheduleResult {
-		const hasUI = this._extensionUIContext !== undefined;
-		const max = hasUI ? 12 * 3600 : 120;
-		let clamped = false;
-		if (seconds < 1) {
-			return {
-				ok: false,
-				error: `wait duration ${seconds}s is out of range (interactive: 1–${12 * 3600}s; headless: 1–120s).`,
-			};
-		}
-		if (seconds > max) {
-			if (!opts?.clamp) {
-				return {
-					ok: false,
-					error: `wait duration ${seconds}s is out of range (interactive: 1–${12 * 3600}s; headless: 1–120s).`,
-				};
-			}
-			seconds = max;
-			clamped = true;
-		}
-		if (!hasUI) {
-			if (this._headlessWaitCount >= 5) {
-				return {
-					ok: false,
-					error: "Headless wait limit reached: 5 waits per session. Continue without waiting.",
-				};
-			}
-			this._headlessWaitCount++;
-		}
-		this._cancelPendingWait();
-		this._waitTimer = setTimeout(() => {
-			this._waitTimer = undefined;
-			void this._fireWaitWakeup().catch(() => {
-				// Best-effort wake-up: avoid an unhandledRejection if the session is
-				// tearing down mid-delivery.
-			});
-		}, seconds * 1000);
-		const clampNote = clamped ? ` (capped at ${max}s — the wait limit for this session)` : "";
-		return {
-			ok: true,
-			message: `Waiting ${seconds}s${clampNote}. The current turn ends now and resumes automatically when the wait completes — background-task completions wake the agent earlier.`,
-		};
-	}
-
-	/** Deliver the wait wake-up: fixed guidance + running background tasks. */
-	private async _fireWaitWakeup(): Promise<void> {
-		// A completion notification is queued and about to be delivered —
-		// firing the wait wake-up too would wake the model twice.
-		if (this._integrationFollowUpBatcher.pendingCount > 0) return;
-		const bg = this._integrationManager.get<BackgroundTasksIntegration>("bg-tasks");
-		let tasks = "  (no background tasks running)";
-		let stillRunning = false;
-		if (bg) {
-			const running = bg.store.list().filter((t) => t.status === "running");
-			if (running.length > 0) {
-				stillRunning = true;
-				tasks = running
-					.map((t) => {
-						const elapsed = ((Date.now() - t.startTime) / 1000).toFixed(0);
-						const label = t.label ? `: ${t.label}` : "";
-						return `  ◐ ${t.id}${label} (${elapsed}s)`;
-					})
-					.join("\n");
-			}
-		}
-		const guidance = stillRunning
-			? "Tasks still running — you can wait again to rest until they finish."
-			: "Check their outputs and continue; start new background tasks as needed.";
-		// Route like the follow-up batcher: steer while the tool loop is
-		// active so the wake-up lands at the next tool-result checkpoint.
-		const streamingBehavior = this.agent.isActive ? "steer" : "followUp";
-		void this.prompt(`${AgentSession.WAIT_WAKEUP_MESSAGE}\nCurrent background tasks:\n${tasks}\n\n${guidance}`, {
-			streamingBehavior,
-			source: "extension",
-		}).catch(() => {
-			// Wake-up delivery is best-effort (session may be tearing down).
-		});
-	}
 	private _cwd: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
@@ -581,10 +466,6 @@ export class AgentSession {
 	private _integrationManager!: IntegrationManager;
 	/** Unified debounce queue for integration-originated follow-ups. */
 	private readonly _integrationFollowUpBatcher = new IntegrationFollowUpBatcher((text) => {
-		// A follow-up is arriving: the model is about to be woken up, so any
-		// pending wait timer is no longer needed (it would fire a redundant
-		// wake-up later).
-		this._cancelPendingWait();
 		// Model's tool loop actually active: steer so the notification lands
 		// at the next tool-result checkpoint instead of waiting for the whole
 		// turn to finish (the model may otherwise notice the completion
@@ -1494,8 +1375,6 @@ export class AgentSession {
 
 		this._integrationFollowUpBatcher.dispose();
 
-		this._cancelPendingWait();
-
 		// Release any pending uncertainty-override confirmation timer so it cannot
 		// fire callbacks against a disposed session.
 		if (this._overrideConfirmationTimer !== undefined) {
@@ -1797,7 +1676,6 @@ export class AgentSession {
 		this._fileContextTracker.stopRotation();
 		// A non-extension input means the user is back: cancel any pending wait.
 		if (options?.source !== "extension") {
-			this._cancelPendingWait();
 		}
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
@@ -3642,7 +3520,6 @@ export class AgentSession {
 						shellPath,
 						exposeProviderSecrets: this.settingsManager.getBashExposeProviderSecrets(),
 						sudo: this._localSudoHandler,
-						waitSchedule: (seconds, opts) => this._scheduleWait(seconds, opts),
 						spawnBg: async (task, label) => {
 							const bg = this._integrationManager.get<BackgroundTasksIntegration>("bg-tasks");
 							if (!bg) {
@@ -3652,8 +3529,6 @@ export class AgentSession {
 							return { id: spawned.id, logFile: spawned.logFile };
 						},
 					},
-					askUser: { askUser: this._askUserHandler },
-					wait: { schedule: (seconds) => this._scheduleWait(seconds) },
 				});
 
 		this._baseToolDefinitions = new Map(

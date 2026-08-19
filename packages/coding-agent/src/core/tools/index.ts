@@ -70,20 +70,18 @@ export {
 
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import type { ToolDefinition } from "../extensions/types.ts";
-import { type AskUserOptions, createAskUserTool, createAskUserToolDefinition } from "./ask-user.ts";
 import { type BashToolOptions, createBashTool, createBashToolDefinition } from "./bash.ts";
 import { createEditTool, createEditToolDefinition, type EditToolOptions } from "./edit.ts";
 import { createFindTool, createFindToolDefinition, type FindToolOptions } from "./find.ts";
 import { createGrepTool, createGrepToolDefinition, type GrepToolOptions } from "./grep.ts";
 import { createLsTool, createLsToolDefinition, type LsToolOptions } from "./ls.ts";
 import { createReadTool, createReadToolDefinition, type ReadToolOptions } from "./read.ts";
-import { createWaitTool, createWaitToolDefinition, type WaitToolOptions } from "./wait.ts";
 import { createWriteTool, createWriteToolDefinition, type WriteToolOptions } from "./write.ts";
 
 export type Tool = AgentTool<any>;
 export type ToolDef = ToolDefinition<any, any>;
-export type ToolName = "read" | "bash" | "edit" | "write" | "ask_user" | "wait";
-export const allToolNames: Set<ToolName> = new Set(["read", "bash", "edit", "write", "ask_user", "wait"]);
+export type ToolName = "read" | "bash" | "edit" | "write" | "grep" | "find" | "ls";
+export const allToolNames: Set<ToolName> = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
 
 export interface ToolsOptions {
 	read?: ReadToolOptions;
@@ -93,8 +91,6 @@ export interface ToolsOptions {
 	grep?: GrepToolOptions;
 	find?: FindToolOptions;
 	ls?: LsToolOptions;
-	askUser?: AskUserOptions;
-	wait?: WaitToolOptions;
 }
 
 export function createToolDefinition(toolName: ToolName, cwd: string, options?: ToolsOptions): ToolDef {
@@ -107,16 +103,12 @@ export function createToolDefinition(toolName: ToolName, cwd: string, options?: 
 			return createEditToolDefinition(cwd, options?.edit);
 		case "write":
 			return createWriteToolDefinition(cwd, options?.write);
-		case "ask_user":
-			return createAskUserToolDefinition(
-				options?.askUser ?? { askUser: async () => ({ ok: false, reason: "no-ui" as const }) },
-			);
-		case "wait":
-			return createWaitToolDefinition(
-				options?.wait ?? {
-					schedule: () => ({ ok: false, error: "wait is unavailable (no scheduler configured)." }),
-				},
-			);
+		case "grep":
+			return createGrepToolDefinition(cwd, options?.grep);
+		case "find":
+			return createFindToolDefinition(cwd, options?.find);
+		case "ls":
+			return createLsToolDefinition(cwd, options?.ls);
 		default:
 			throw new Error(`Unknown tool name: ${toolName}`);
 	}
@@ -132,6 +124,12 @@ export function createTool(toolName: ToolName, cwd: string, options?: ToolsOptio
 			return createEditTool(cwd, options?.edit);
 		case "write":
 			return createWriteTool(cwd, options?.write);
+		case "grep":
+			return createGrepTool(cwd, options?.grep);
+		case "find":
+			return createFindTool(cwd, options?.find);
+		case "ls":
+			return createLsTool(cwd, options?.ls);
 		default:
 			throw new Error(`Unknown tool name: ${toolName}`);
 	}
@@ -161,14 +159,9 @@ export function createAllToolDefinitions(cwd: string, options?: ToolsOptions): R
 		bash: createBashToolDefinition(cwd, options?.bash),
 		edit: createEditToolDefinition(cwd, options?.edit),
 		write: createWriteToolDefinition(cwd, options?.write),
-		ask_user: createAskUserToolDefinition(
-			options?.askUser ?? { askUser: async () => ({ ok: false, reason: "no-ui" as const }) },
-		),
-		wait: createWaitToolDefinition(
-			options?.wait ?? {
-				schedule: () => ({ ok: false, error: "wait is unavailable (no scheduler configured)." }),
-			},
-		),
+		grep: createGrepToolDefinition(cwd, options?.grep),
+		find: createFindToolDefinition(cwd, options?.find),
+		ls: createLsToolDefinition(cwd, options?.ls),
 	};
 }
 
@@ -196,13 +189,8 @@ export function createAllTools(cwd: string, options?: ToolsOptions): Record<Tool
 		bash: createBashTool(cwd, options?.bash),
 		edit: createEditTool(cwd, options?.edit),
 		write: createWriteTool(cwd, options?.write),
-		ask_user: createAskUserTool(
-			options?.askUser ?? { askUser: async () => ({ ok: false, reason: "no-ui" as const }) },
-		),
-		wait: createWaitTool(
-			options?.wait ?? {
-				schedule: () => ({ ok: false, error: "wait is unavailable (no scheduler configured)." }),
-			},
-		),
+		grep: createGrepTool(cwd, options?.grep),
+		find: createFindTool(cwd, options?.find),
+		ls: createLsTool(cwd, options?.ls),
 	};
 }
