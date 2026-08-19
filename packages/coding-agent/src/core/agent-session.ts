@@ -102,7 +102,7 @@ import {
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import { FileChangeHistory, type FileRevertResult } from "./file-history.ts";
-import { getBgSpawner, registerForkHost } from "./fork-host.ts";
+import { registerForkHost } from "./fork-host.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
@@ -2892,16 +2892,6 @@ export class AgentSession {
 						shellPath,
 						exposeProviderSecrets: this.settingsManager.getBashExposeProviderSecrets(),
 						sudo: this._localSudoHandler,
-						spawnBg: async (task, label) => {
-							// fork(pi-ex): the bg-tasks extension registers the spawner
-							// on the fork host bridge at load time.
-							const spawn = getBgSpawner();
-							if (!spawn) {
-								throw new Error("background tasks are unavailable");
-							}
-							const spawned = await spawn(task, this._cwd, 12 * 3600 * 1000, this.sessionId, label);
-							return { id: spawned.id, logFile: spawned.logFile };
-						},
 					},
 				});
 

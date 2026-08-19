@@ -19,7 +19,6 @@ import {
 	untrackDetachedChildPid,
 } from "../../utils/shell.ts";
 import { formatTimeout, type TimeoutInput, TimeoutParamSchema, timeoutToMs } from "../../utils/timeout.ts";
-import { checkBashGate, classifyBashGateCommand, formatGateResponse } from "../bash-gate.ts";
 import { getExperimentalToolSampling } from "../experimental.ts";
 import type { ExtensionContext, ToolDefinition, ToolRenderResultOptions } from "../extensions/types.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
@@ -382,7 +381,6 @@ export interface BashToolOptions {
 	 * commands and polling loops). Returns the spawned task's id and log
 	 * path, or throws when background tasks are unavailable.
 	 */
-	spawnBg?: (task: string, label?: string) => Promise<{ id: string; logFile: string }>;
 }
 
 const BASH_PREVIEW_LINES = 5;
@@ -711,19 +709,6 @@ export function createBashToolDefinition(
 			onUpdate?,
 			ctx?,
 		) {
-			// ── Bash Gate: block commands that duplicate pi tools ──────
-			const gateMatch = checkBashGate(command);
-			if (gateMatch) {
-				const converted = await autoConvertGatedCommand(command, gateMatch.rule.name, options ?? {});
-				if (converted) {
-					return converted;
-				}
-				return {
-					content: [{ type: "text", text: formatGateResponse(gateMatch) }],
-					details: undefined,
-				};
-			}
-
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
 			const spawnContext = resolveSpawnContext(
 				resolvedCommand,
@@ -938,76 +923,4 @@ export function createBashTool(cwd: string, options?: BashToolOptions): AgentToo
 		promptGuidelines: definition.promptGuidelines,
 	});
 	return tool;
-}
-
-const MAX_BG_SLEEP_SECONDS = 12 * 3600;
-
-/**
- * Find sleep invocations exceeding MAX_BG_SLEEP_SECONDS in a task command.
- * fork(pi-ex): local copy — the canonical one lives in the bg-tasks
- * extension (both are stable; keep the regex in sync).
- */
-function findOversizedSleep(command: string): { value: number; unit: string; seconds: number } | undefined {
-	const re = /(?:^|[;\n&|]|\bdo\s+|\bthen\s+|\belse\s+)\s*sleep\s+(\d+(?:\.\d+)?)([smhd]?)\b/g;
-	let match = re.exec(command);
-	while (match) {
-		const value = Number.parseFloat(match[1]);
-		const unit = match[2] || "s";
-		const factor = unit === "d" ? 86400 : unit === "h" ? 3600 : unit === "m" ? 60 : 1;
-		const seconds = value * factor;
-		if (seconds > MAX_BG_SLEEP_SECONDS) {
-			return { value, unit: unit || "s", seconds };
-		}
-		match = re.exec(command);
-	}
-	return undefined;
-}
-
-/**
- * Auto-convert gate-blocked sleep commands:
- *
- * - pure `sleep N` → the wait tool (clamped to the session cap, ends the turn)
- * - `sleep ... && cmd`, `while/until` polling loops, and `watch` → the whole
- *   command runs as one background task via bg_spawn
- *
- * Returns a tool result when the command was converted, or undefined when the
- * conversion is not possible (unparseable sleep, oversized background sleep,
- * wait scheduler unavailable) and the ordinary gate response should be shown.
- */
-async function autoConvertGatedCommand(
-	command: string,
-	ruleName: string,
-	options: BashToolOptions,
-): Promise<AgentToolResult<BashToolDetails | undefined> | undefined> {
-	const classification = classifyBashGateCommand(command, ruleName);
-	if (classification.kind === "bg") {
-		if (!options.spawnBg) {
-			return undefined;
-		}
-		const badSleep = findOversizedSleep(command);
-		if (badSleep) {
-			return undefined;
-		}
-		try {
-			const task = await options.spawnBg(command, command.substring(0, 60));
-			return {
-				content: [
-					{
-						type: "text",
-						text: [
-							`Converted to a background task: the command now runs in tmux and its output arrives with the completion notice.`,
-							`ID: ${task.id}`,
-							`Log: ${task.logFile}`,
-							"",
-							`Check: /fg ${task.id}  |  Kill: /kill ${task.id}  |  Manage: /tasks`,
-						].join("\n"),
-					},
-				],
-				details: { convertedToBackgroundTask: { taskId: task.id, logFile: task.logFile } },
-			};
-		} catch {
-			return undefined;
-		}
-	}
-	return undefined;
 }
