@@ -72,6 +72,7 @@ export interface SubagentsSettings {
 	timeout?: number; // default: 7200 (2h) - per-run timeout in SECONDS
 	gitName?: string; // default: "pi-subagent" - git author name for sub-agent commits
 	gitEmail?: string; // default: "pi-subagent@localhost" - git author email for sub-agent commits
+	model?: string; // default: inherit the main agent's model - "provider/id" or bare id used when a spawn has no model override
 }
 
 export interface RecallSettings {
@@ -891,6 +892,10 @@ export class SettingsManager {
 
 	getSubagentsGitEmail(): string {
 		return this.settings.subagents?.gitEmail ?? "pi-subagent@localhost";
+	}
+
+	getSubagentsModel(): string | undefined {
+		return this.settings.subagents?.model;
 	}
 
 	getRecallEnabled(): boolean {
