@@ -31,8 +31,6 @@
 			"@earendil-works/pi-server/testing": ["./packages/server/src/testing/index.ts"],
 			"@earendil-works/pi-server/unix": ["./packages/server/src/transports/unix/index.ts"],
 			"@earendil-works/pi-server/*": ["./packages/server/src/*"],
-			"@earendil-works/pi-subagent-core": ["./packages/subagent-core/src/index.ts"],
-			"@earendil-works/pi-subagent-core/*": ["./packages/subagent-core/src/*"],
 			"typebox": ["./node_modules/typebox"],
 			"@earendil-works/pi-tui": ["./packages/tui/src/index.ts"],
 			"@earendil-works/pi-tui/*": ["./packages/tui/src/*"],

@@ -83,7 +83,6 @@ import type {
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
 import { shareSessionAsGist } from "../../core/gist.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
-import type { SubagentIntegration } from "../../core/integrations/subagent/index.ts";
 import type { InteractionPort } from "../../core/interaction-port.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
 import { createCompactionSummaryMessage } from "../../core/messages.ts";
@@ -3062,16 +3061,6 @@ export class InteractiveMode {
 			if (text === "/attach" || text.startsWith("/attach ")) {
 				this.editor.setText("");
 				await this.handleAttachCommand(text === "/attach" ? "" : text.slice(8).trim());
-				return;
-			}
-			if (text === "/subagent") {
-				this.editor.setText("");
-				const subagent = this.controller.getIntegration<SubagentIntegration>("subagent");
-				if (!subagent) {
-					this.showWarning('Sub-agents are disabled. Enable via "subagents": { "enabled": true }.');
-					return;
-				}
-				subagent.showStatusWidget();
 				return;
 			}
 			if (text === "/reload") {

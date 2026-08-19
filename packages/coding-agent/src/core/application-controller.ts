@@ -18,7 +18,6 @@ import type { ImageContent } from "@earendil-works/pi-ai/compat";
 import type { AgentSession, AgentSessionEventListener, ModelCycleResult, PromptOptions } from "./agent-session.ts";
 import type { AgentSessionRuntime } from "./agent-session-runtime.ts";
 import type { CompactionResult } from "./compaction/fork.ts";
-import type { CoreIntegration } from "./integrations/types.ts";
 import type { InteractionPort } from "./interaction-port.ts";
 import type { SessionTreeNode } from "./session-manager.ts";
 
@@ -378,11 +377,6 @@ export class ApplicationController {
 	/** Bind extension UI/mode/actions and emit the session-start event. */
 	bindExtensions(...args: Parameters<AgentSession["bindExtensions"]>): ReturnType<AgentSession["bindExtensions"]> {
 		return this._session.bindExtensions(...args);
-	}
-
-	/** Access a core integration (e.g. "todo") by id. */
-	getIntegration<T extends CoreIntegration = CoreIntegration>(id: string): T | undefined {
-		return this._session.getIntegration<T>(id);
 	}
 
 	// -----------------------------------------------------------------------

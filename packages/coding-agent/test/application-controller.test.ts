@@ -61,7 +61,6 @@ interface FakeSession {
 	respondOverrideConfirmation: (accepted: boolean) => boolean;
 	getToolDefinition: (name: string) => unknown;
 	bindExtensions: (bindings: unknown) => Promise<void>;
-	getIntegration: (id: string) => unknown;
 	// Bash execution and retry
 	isBashRunning: boolean;
 	executeBash: (command: string, onChunk?: (chunk: string) => void, options?: unknown) => Promise<unknown>;
@@ -204,10 +203,6 @@ function makeFakeSession(name: string): FakeSession {
 		},
 		bindExtensions: async (bindings) => {
 			record("bindExtensions", bindings ? "bindings" : "");
-		},
-		getIntegration: (id) => {
-			record("getIntegration", id);
-			return { id };
 		},
 		// Bash execution and retry
 		isBashRunning: false,
@@ -426,7 +421,7 @@ describe("ApplicationController", () => {
 		expect(calls).toContain("abortBranchSummary()");
 	});
 
-	it("delegates core state, bash/retry, queries/exports, and integrations", async () => {
+	it("delegates core state, bash/retry, queries/exports", async () => {
 		const holder = { current: makeFakeSession("a") };
 		const controller = new ApplicationController(makeHost(holder, []), makeInteractions());
 
@@ -437,7 +432,6 @@ describe("ApplicationController", () => {
 		expect(controller.respondOverrideConfirmation(true)).toBe(true);
 		controller.getToolDefinition("read");
 		await controller.bindExtensions({ uiContext: undefined });
-		controller.getIntegration("todo");
 
 		// bash / retry
 		expect(controller.isBashRunning).toBe(false);
@@ -469,7 +463,6 @@ describe("ApplicationController", () => {
 		expect(calls).toContain("respondOverrideConfirmation(true)");
 		expect(calls).toContain("getToolDefinition(read)");
 		expect(calls).toContain("bindExtensions(bindings)");
-		expect(calls).toContain("getIntegration(todo)");
 		expect(calls).toContain("executeBash(ls,onChunk,opts)");
 		expect(calls).toContain("abortBash()");
 		expect(calls).toContain("recordBashResult(ls,result,opts)");

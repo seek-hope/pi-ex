@@ -118,9 +118,6 @@ import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import { FileContextTracker, formatFileTime } from "./file-context.ts";
 import { FileChangeHistory, type FileRevertResult } from "./file-history.ts";
 import { getBgSpawner, registerForkHost } from "./fork-host.ts";
-import { IntegrationFollowUpBatcher } from "./integrations/followup-batcher.ts";
-import { IntegrationManager } from "./integrations/manager.ts";
-import type { CoreIntegration } from "./integrations/types.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
@@ -430,25 +427,7 @@ export class AgentSession {
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _sessionStartEvent: SessionStartEvent;
 	private _extensionUIContext?: ExtensionUIContext;
-	private _integrationManager!: IntegrationManager;
 	/** Unified debounce queue for integration-originated follow-ups. */
-	private readonly _integrationFollowUpBatcher = new IntegrationFollowUpBatcher((text) => {
-		// Model's tool loop actually active: steer so the notification lands
-		// at the next tool-result checkpoint instead of waiting for the whole
-		// turn to finish (the model may otherwise notice the completion
-		// itself first and the notification arrives late, as a redundant
-		// follow-up). Loop idle: followUp starts a new turn as before. The
-		// distinction matters during post-run processing (compaction/retry):
-		// the session flag is still set there but the loop is gone, so
-		// queueing would strand the message until the next user input.
-		const streamingBehavior = this.agent.isActive ? "steer" : "followUp";
-		void this.prompt(text, { streamingBehavior, source: "extension" }).catch((err) => {
-			// Follow-up delivery is best-effort (session may be tearing down), but
-			// a genuine failure must not vanish without a trace — a lost follow-up
-			// means a lost task-completion report.
-			console.error("Integration follow-up delivery failed:", err);
-		});
-	});
 	private _extensionMode: ExtensionMode = "print";
 	private _extensionCommandContextActions?: ExtensionCommandContextActions;
 	private _extensionAbortHandler?: () => void;
@@ -478,6 +457,7 @@ export class AgentSession {
 		registerForkHost(this.sessionManager, {
 			streamFn: this.agent.streamFunction,
 			settingsManager: this.settingsManager,
+			modelRuntime: config.modelRuntime,
 		});
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
@@ -582,10 +562,6 @@ export class AgentSession {
 	 */
 	private _installAgentToolHooks(): void {
 		this.agent.beforeToolCall = async ({ toolCall, args }) => {
-			const integrationBlock = this._integrationManager?.onToolCall(toolCall.name, args as Record<string, unknown>);
-			if (integrationBlock) {
-				return integrationBlock;
-			}
 			const runner = this._extensionRunner;
 			if (!runner.hasHandlers("tool_call")) {
 				return undefined;
@@ -792,7 +768,6 @@ export class AgentSession {
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
 
 		if (event.type === "agent_end") {
-			this._integrationManager?.onAgentEnd();
 			// The agent is idle until the next user input — rotate the file-state
 			// checks now (stops again on the next prompt).
 			this._fileContextTracker.startRotation();
@@ -1340,8 +1315,6 @@ export class AgentSession {
 			// Dispose must succeed even if an abort hook throws.
 		}
 
-		this._integrationFollowUpBatcher.dispose();
-
 		// Release any pending uncertainty-override confirmation timer so it cannot
 		// fire callbacks against a disposed session.
 		if (this._overrideConfirmationTimer !== undefined) {
@@ -1349,8 +1322,6 @@ export class AgentSession {
 			this._overrideConfirmationTimer = undefined;
 			this._overrideConfirmation = undefined;
 		}
-
-		this._integrationManager?.onShutdown();
 
 		this._extensionRunner.invalidate(
 			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
@@ -1425,9 +1396,6 @@ export class AgentSession {
 	}
 
 	/** Access a core integration (e.g. "todo") by id. */
-	getIntegration<T extends CoreIntegration = CoreIntegration>(id: string): T | undefined {
-		return this._integrationManager?.get<T>(id);
-	}
 
 	/**
 	 * Set active tools by name.
@@ -3412,27 +3380,6 @@ export class AgentSession {
 			Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition]),
 		);
 
-		// Core integrations (todo flow, subagent, …): rebuilt alongside extensions.
-		this._integrationManager?.onShutdown();
-		let manager: IntegrationManager;
-		manager = new IntegrationManager({
-			cwd: this._cwd,
-			sessionManager: this.sessionManager,
-			settingsManager: this.settingsManager,
-			modelRuntime: this._modelRuntime,
-			getUI: () => this._extensionUIContext,
-			getModel: () => this.model,
-			getIntegration: (id) => manager?.get(id),
-			// All integration follow-ups funnel through one debounce queue so
-			// bursts of completions (local + SSH bg tasks, monitors) merge into
-			// a single input turn instead of one turn per notification.
-			sendFollowUp: (text) => this._integrationFollowUpBatcher.push(text),
-		});
-		this._integrationManager = manager;
-		for (const definition of this._integrationManager.getToolDefinitions()) {
-			this._baseToolDefinitions.set(definition.name, definition);
-		}
-
 		const extensionsResult = this._resourceLoader.getExtensions();
 		if (options.flagValues) {
 			for (const [name, value] of options.flagValues) {
@@ -3453,22 +3400,17 @@ export class AgentSession {
 		this._bindExtensionCore(this._extensionRunner);
 		this._applyExtensionBindings(this._extensionRunner);
 
-		const integrationDefaultNames = this._integrationManager
-			.getDefaultActiveToolNames()
-			.filter(
-				(name) =>
-					!this._excludedToolNames?.has(name) && (!this._allowedToolNames || this._allowedToolNames.has(name)),
-			);
+		// fork(pi-ex): ask_user/wait and the integration tools (todo_write,
+		// bg_*, ssh_*, subagent_*) are extension tools now — activated via
+		// includeAllExtensionTools when the extensions are loaded.
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: ["read", "bash", "edit", "write", "ask_user", "wait", ...integrationDefaultNames];
+			: ["read", "bash", "edit", "write"];
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,
 			includeAllExtensionTools: options.includeAllExtensionTools,
 		});
-
-		this._integrationManager.onSessionStart();
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
@@ -3965,7 +3907,6 @@ export class AgentSession {
 				summaryEntry,
 				fromExtension: summaryText ? fromExtension : undefined,
 			});
-			this._integrationManager.onSessionTree();
 
 			// Emit to custom tools
 

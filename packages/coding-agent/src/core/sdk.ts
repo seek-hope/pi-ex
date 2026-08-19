@@ -7,7 +7,6 @@ import { AgentSession } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
-import { getDefaultIntegrationToolNames } from "./integrations/manager.ts";
 import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
@@ -244,15 +243,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		thinkingLevel = clampThinkingLevel(model, thinkingLevel) as ThinkingLevel;
 	}
 
-	const defaultActiveToolNames: string[] = [
-		"read",
-		"bash",
-		"edit",
-		"write",
-		"ask_user",
-		"wait",
-		...getDefaultIntegrationToolNames(settingsManager),
-	];
+	// fork(pi-ex): the integration tools (todo_write, bg_*, ssh_*, subagent_*)
+	// and ask_user/wait are extension tools now; the built-in default set is
+	// just the four file/shell tools.
+	const defaultActiveToolNames: string[] = ["read", "bash", "edit", "write"];
 	const configuredDefaultToolNames = settingsManager.getDefaultTools();
 	const allowedToolNames = options.tools ?? (options.noTools === "all" ? [] : undefined);
 	const excludedToolNames = options.excludeTools;

@@ -11,12 +11,14 @@
  * agent-session.ts instead of scattered across the codebase.
  */
 import type { StreamFn } from "@earendil-works/pi-agent-core";
+import type { ModelRuntime } from "./model-runtime.ts";
 import type { SessionManager } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 
 export interface ForkHostHandle {
 	streamFn: StreamFn | undefined;
 	settingsManager: SettingsManager;
+	modelRuntime: ModelRuntime;
 }
 
 const hosts = new WeakMap<SessionManager, ForkHostHandle>();
