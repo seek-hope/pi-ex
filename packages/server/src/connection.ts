@@ -1,4 +1,4 @@
-import type { ClientMessageDecoder } from "@earendil-works/pi-protocol";
+import type { ClientMessageDecoder, LeaseMode } from "@earendil-works/pi-protocol";
 
 import type { MaybePromise } from "./types.ts";
 
@@ -19,11 +19,17 @@ export type ByteConnectionAcceptor = (connection: ByteConnection) => ByteConnect
 
 export type ConnectionStage = "awaitingHello" | "handshaking" | "ready" | "closing" | "closed";
 
+/** Per-connection per-session lease record; the server is the only authority on its mode. */
+export interface ConnectionSessionLease {
+	mode: LeaseMode;
+}
+
 export interface ConnectionState {
 	id: string;
 	connection: ByteConnection;
 	decoder: ClientMessageDecoder;
-	sessionIds: Set<string>;
+	/** Session id -> this connection's lease mode for that session. */
+	sessionLeases: Map<string, ConnectionSessionLease>;
 	stage: ConnectionStage;
 	disconnected: boolean;
 	handshakeComplete: boolean;

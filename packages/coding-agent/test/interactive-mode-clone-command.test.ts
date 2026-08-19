@@ -3,7 +3,7 @@ import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 
 type CloneCommandContext = {
 	sessionManager: { getLeafId: () => string | null };
-	runtimeHost: {
+	controller: {
 		fork: (entryId: string, options?: { position?: "before" | "at" }) => Promise<{ cancelled: boolean }>;
 	};
 	renderCurrentSessionState: () => void;
@@ -30,7 +30,7 @@ describe("InteractiveMode /clone", () => {
 
 		const context: CloneCommandContext = {
 			sessionManager: { getLeafId: () => "leaf-123" },
-			runtimeHost: { fork },
+			controller: { fork },
 			renderCurrentSessionState,
 			editor: { setText },
 			showStatus,
@@ -55,7 +55,7 @@ describe("InteractiveMode /clone", () => {
 
 		const context: CloneCommandContext = {
 			sessionManager: { getLeafId: () => null },
-			runtimeHost: { fork },
+			controller: { fork },
 			renderCurrentSessionState: vi.fn(),
 			editor: { setText: vi.fn() },
 			showStatus,

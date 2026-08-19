@@ -49,7 +49,9 @@ describe("RemoteSession lifecycle", () => {
 		const opening = remoteSession.open("session-2");
 		await expect(remoteSession.submit("race")).rejects.toThrow("Remote session is busy with open");
 		await expect(remoteSession.create({ cwd: "/other" })).rejects.toThrow("Remote session is busy with open");
-		expect(requests.map(({ request }) => request)).toEqual([{ command: "attach", sessionId: "session-2" }]);
+		expect(requests.map(({ request }) => request)).toEqual([
+			{ command: "attach", sessionId: "session-2", leaseMode: "exclusive" },
+		]);
 
 		const attachRequest = requests[0];
 		if (!attachRequest) throw new Error("Missing attach request");

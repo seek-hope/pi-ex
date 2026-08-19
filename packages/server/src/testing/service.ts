@@ -1,18 +1,25 @@
 import type {
+	InteractionRequest,
 	ModelMetadata,
 	ModelRef,
+	QueueKind,
+	QueueMode,
 	SessionMetadata,
 	SessionPhase,
-	SessionSnapshot,
+	SurfaceUpdateOperation,
 	ThinkingLevel,
 	TranscriptProgress,
 } from "@earendil-works/pi-protocol";
 import { PiServerError } from "../errors.ts";
 import type {
 	CreateSessionOptions,
+	MaybePromise,
 	PiServerService,
 	PiSessionRuntime,
+	PiSessionRuntimeCommand,
 	PiSessionRuntimeEvent,
+	PiSessionRuntimeResult,
+	PiSessionRuntimeSnapshot,
 	PromptInput,
 } from "../types.ts";
 
@@ -46,7 +53,12 @@ export class Deferred<T> {
 }
 
 interface StoredSession {
-	snapshot: SessionSnapshot;
+	snapshot: PiSessionRuntimeSnapshot;
+}
+
+function textOf(input: PromptInput): string {
+	const parts = input.content.map((part) => (part.type === "text" ? part.text : "[image]")).join("");
+	return parts;
 }
 
 export class TestSessionRuntime implements PiSessionRuntime {
@@ -63,7 +75,7 @@ export class TestSessionRuntime implements PiSessionRuntime {
 		this.onDispose = onDispose;
 	}
 
-	snapshot(): SessionSnapshot {
+	snapshot(): PiSessionRuntimeSnapshot {
 		return structuredClone(this.stored.snapshot);
 	}
 
@@ -73,6 +85,7 @@ export class TestSessionRuntime implements PiSessionRuntime {
 
 	async prompt(input: PromptInput): Promise<void> {
 		if (this.getPhase() !== "idle") throw new PiServerError("busy", "A prompt is already running");
+		const text = textOf(input);
 		const done = new Deferred<"complete" | "aborted">();
 		this.pendingPrompt = { input, done };
 		this.update({
@@ -82,7 +95,7 @@ export class TestSessionRuntime implements PiSessionRuntime {
 				{
 					id: `user-${this.stored.snapshot.revision + 1}`,
 					role: "user",
-					content: [{ type: "text", text: input.text }],
+					content: [{ type: "text", text }],
 					timestamp: this.stored.snapshot.revision + 1,
 				},
 			],
@@ -93,7 +106,7 @@ export class TestSessionRuntime implements PiSessionRuntime {
 				? {
 						id: `assistant-${this.stored.snapshot.revision + 1}`,
 						role: "assistant" as const,
-						content: [{ type: "text" as const, text: `reply:${input.text}` }],
+						content: [{ type: "text" as const, text: `reply:${text}` }],
 						status: "complete" as const,
 						model: this.stored.snapshot.model,
 						stopReason: "stop" as const,
@@ -117,6 +130,7 @@ export class TestSessionRuntime implements PiSessionRuntime {
 
 	async steer(input: PromptInput): Promise<void> {
 		if (this.getPhase() === "idle") throw new PiServerError("busy", "There is no active prompt to steer");
+		const text = textOf(input);
 		this.steers.push(input);
 		this.update({
 			queuedSteerCount: this.stored.snapshot.queuedSteerCount + 1,
@@ -125,7 +139,7 @@ export class TestSessionRuntime implements PiSessionRuntime {
 				{
 					id: `steer-${this.stored.snapshot.revision + 1}`,
 					role: "user",
-					content: [{ type: "text", text: input.text }],
+					content: [{ type: "text", text }],
 					timestamp: this.stored.snapshot.revision + 1,
 				},
 			],
@@ -147,6 +161,12 @@ export class TestSessionRuntime implements PiSessionRuntime {
 		this.update({ thinkingLevel });
 	}
 
+	executeCommand<const TCommand extends PiSessionRuntimeCommand>(
+		command: TCommand,
+	): MaybePromise<PiSessionRuntimeResult<TCommand>> {
+		throw new PiServerError("not_implemented", `Test runtime does not implement ${command.command}`);
+	}
+
 	subscribe(listener: (event: PiSessionRuntimeEvent) => void): () => void {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
@@ -162,6 +182,10 @@ export class TestSessionRuntime implements PiSessionRuntime {
 		this.stored.snapshot = { ...this.stored.snapshot, phase };
 	}
 
+	setName(name: string): void {
+		this.update({ name });
+	}
+
 	finishPrompt(): void {
 		if (!this.pendingPrompt) throw new Error("No prompt is pending");
 		this.pendingPrompt.done.resolve("complete");
@@ -169,6 +193,18 @@ export class TestSessionRuntime implements PiSessionRuntime {
 
 	emitProgress(progress: TranscriptProgress): void {
 		for (const listener of this.listeners) listener({ type: "progress", progress });
+	}
+
+	emitSurface(operation: SurfaceUpdateOperation): void {
+		for (const listener of this.listeners) listener({ type: "surface", operation });
+	}
+
+	emitInteraction(request: InteractionRequest): void {
+		for (const listener of this.listeners) listener({ type: "interaction", request });
+	}
+
+	emitQueue(queue: QueueKind, mode: QueueMode, queuedCount: number): void {
+		for (const listener of this.listeners) listener({ type: "queue", queue, mode, queuedCount });
 	}
 
 	emitError(error: PiServerError): void {
@@ -179,7 +215,7 @@ export class TestSessionRuntime implements PiSessionRuntime {
 		for (const listener of this.listeners) listener({ type: "snapshot" });
 	}
 
-	private update(updates: Partial<SessionSnapshot>): void {
+	private update(updates: Partial<PiSessionRuntimeSnapshot>): void {
 		this.stored.snapshot = {
 			...this.stored.snapshot,
 			...updates,
@@ -251,13 +287,18 @@ export class TestServerService implements PiServerService {
 				updatedAt: 1,
 				phase: "idle",
 				model,
+				scopedModels: [model],
 				thinkingLevel,
-				attached: false,
-				locked: false,
 				revision: 0,
 				transcript: [],
 				queuedSteer: [],
 				queuedSteerCount: 0,
+				queuedFollowUp: [],
+				queuedFollowUpCount: 0,
+				steeringMode: "all",
+				followUpMode: "all",
+				surface: {},
+				pendingInteractions: [],
 			},
 		});
 	}

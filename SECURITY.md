@@ -21,6 +21,36 @@ skills and only to use pi within trusted repositories.  This is because files
 like `AGENTS.md` or instructions in comments can be used to prompt inject the
 coding agent trivially and this cannot be protected against.
 
+## Threat Model
+
+Pi runs entirely within the trust boundary of the local user who launched it. It does
+not provide a sandbox and should not be run as a security boundary. **Trusting a
+repository authorizes its `.pi/extensions/` directory and the `bash` tool to execute
+arbitrary code with the full privileges of your user account.** When you clone a
+repository you do not trust, do **not** choose to Trust it; inspect its extensions and
+configuration before granting trust.
+
+Extensions and bash commands run in the same process environment as Pi. They inherit
+all process environment variables, including any API keys Pi resolves from them, and a
+bash subprocess can read those secrets from its environment at any time. Treat anything
+that runs under a trusted repository as having access to those credentials.
+
+## Credential Storage
+
+- API credentials are stored in `~/.pi/agent/auth.json`, created with `0600`
+  permissions so only the owning user can read or write it.
+- A credential value written as `!command` is not stored verbatim: Pi executes the
+  command (in the main process) and parses the key from the command's output at
+  runtime, so the raw secret is never persisted to disk.
+
+## Truncated Bash Output
+
+When a command's output is too large to display, Pi writes the full output to a
+randomly named file (`pi-output-<random>.log`) in the system temp directory and prints
+only a truncated view. The file is scheduled for deletion after a short retention
+period (2 hours) and swept on process exit. Its content may include sensitive data
+from the command's output, so treat it with the same care as other local logs.
+
 ## Reporting a Vulnerability
 
 If you believe you found a security vulnerability in pi or another package in

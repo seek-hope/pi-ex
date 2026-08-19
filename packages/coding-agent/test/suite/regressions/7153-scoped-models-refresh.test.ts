@@ -27,6 +27,7 @@ function openSelector(harness: Harness, initialModels: readonly Model<Api>[]) {
 	);
 	const context = {
 		session: harness.session,
+		controller: { scopedModels: harness.session.scopedModels },
 		settingsManager: harness.settingsManager,
 		showSelector: (
 			factory: (close: () => void) => {

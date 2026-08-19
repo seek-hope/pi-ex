@@ -7,6 +7,7 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 	private done = false;
 	private finalResultPromise: Promise<R>;
 	private resolveFinalResult!: (result: R) => void;
+	private finalResultResolved = false;
 	private isComplete: (event: T) => boolean;
 	private extractResult: (event: T) => R;
 
@@ -18,12 +19,18 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 		});
 	}
 
+	private resolveFinalOnce(result: R): void {
+		if (this.finalResultResolved) return;
+		this.finalResultResolved = true;
+		this.resolveFinalResult(result);
+	}
+
 	push(event: T): void {
 		if (this.done) return;
 
 		if (this.isComplete(event)) {
 			this.done = true;
-			this.resolveFinalResult(this.extractResult(event));
+			this.resolveFinalOnce(this.extractResult(event));
 		}
 
 		// Deliver to waiting consumer or queue it
@@ -38,7 +45,11 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 	end(result?: R): void {
 		this.done = true;
 		if (result !== undefined) {
-			this.resolveFinalResult(result);
+			this.resolveFinalOnce(result);
+		} else if (!this.finalResultResolved) {
+			// No terminal event was pushed and no explicit result given: resolve
+			// with undefined so result()/complete() never hangs on such streams.
+			this.resolveFinalOnce(undefined as R);
 		}
 		// Notify all waiting consumers that we're done
 		while (this.waiting.length > 0) {

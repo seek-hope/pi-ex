@@ -315,6 +315,11 @@ export class Agent {
 		return this.activeRun?.abortController.signal;
 	}
 
+	/** True while an agent run (the tool loop) is actually active. */
+	get isActive(): boolean {
+		return this.activeRun !== undefined;
+	}
+
 	/** Abort the current run, if one is active. */
 	abort(): void {
 		this.activeRun?.abortController.abort();
@@ -331,7 +336,9 @@ export class Agent {
 
 	/** Clear transcript state, runtime state, and queued messages. */
 	reset(): void {
-		if (this.activeRun) {
+		if (this.activeRun || this._state.isStreaming) {
+			// activeRun may be cleared a hair before isStreaming in edge paths; require
+			// both to be clear so an aborted run's late listener work cannot race a reset.
 			throw new Error("Agent is already processing. Wait for completion before resetting.");
 		}
 
@@ -463,10 +470,16 @@ export class Agent {
 			prepareNextTurn:
 				this.prepareNextTurnWithContext || this.prepareNextTurn
 					? async (context) => {
-							if (this.prepareNextTurnWithContext) {
-								return await this.prepareNextTurnWithContext(context, this.signal);
+							const snapshot = this.prepareNextTurnWithContext
+								? await this.prepareNextTurnWithContext(context, this.signal)
+								: await this.prepareNextTurn?.(this.signal);
+							// Keep Agent.state in sync with what the loop actually requests, so
+							// observers do not see a stale model/thinking level mid-run.
+							if (snapshot) {
+								if (snapshot.model) this._state.model = snapshot.model;
+								if (snapshot.thinkingLevel !== undefined) this._state.thinkingLevel = snapshot.thinkingLevel;
 							}
-							return await this.prepareNextTurn?.(this.signal);
+							return snapshot;
 						}
 					: undefined,
 			convertToLlm: this.convertToLlm,

@@ -41,4 +41,7 @@ todo.md
 plans/
 .pi/hf-sessions/
 .pi/hf-sessions-backup/
+# Extensions live only in the user-level checkout (~/.pi/agent/extensions,
+# a clone of seek-hope/pi-extensions); this fork tracks nothing here.
+.pi/extensions/
 collect.sh

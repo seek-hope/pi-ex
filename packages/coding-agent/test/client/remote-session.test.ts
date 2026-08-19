@@ -31,6 +31,7 @@ describe("RemoteSession operations", () => {
 			type: "event",
 			event: {
 				type: "session_progress",
+				eventCursor: 1,
 				sessionId: "session-1",
 				progress: {
 					type: "assistant_delta",
@@ -61,7 +62,7 @@ describe("RemoteSession operations", () => {
 		const requests = collectRequests(server);
 		const reopening = remoteSession.open("session-1");
 		const request = requests.at(-1);
-		expect(request?.request).toEqual({ command: "attach", sessionId: "session-1" });
+		expect(request?.request).toEqual({ command: "attach", sessionId: "session-1", leaseMode: "exclusive" });
 		if (!request) throw new Error("Missing attach request");
 		server.send({
 			type: "response",
@@ -84,7 +85,11 @@ describe("RemoteSession operations", () => {
 
 		const prompting = remoteSession.submit("  first prompt  ");
 		const request = requests.at(-1);
-		expect(request?.request).toEqual({ command: "prompt", sessionId: "session-1", text: "first prompt" });
+		expect(request?.request).toEqual({
+			command: "prompt",
+			sessionId: "session-1",
+			content: [{ type: "text", text: "first prompt" }],
+		});
 		expect(remoteSession.operation).toBe("submit");
 		if (!request) throw new Error("Missing prompt request");
 		server.send({
@@ -110,7 +115,11 @@ describe("RemoteSession operations", () => {
 
 		const steering = remoteSession.submit("adjust");
 		const request = requests.at(-1);
-		expect(request?.request).toEqual({ command: "steer", sessionId: "session-1", text: "adjust" });
+		expect(request?.request).toEqual({
+			command: "steer",
+			sessionId: "session-1",
+			content: [{ type: "text", text: "adjust" }],
+		});
 		if (!request) throw new Error("Missing steer request");
 		server.send({
 			type: "response",

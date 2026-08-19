@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getModel } from "@earendil-works/pi-ai/compat";
@@ -30,6 +30,19 @@ describe("regression #3592: no-builtin-tools keeps extension tools enabled", () 
 	});
 
 	async function createSession(options?: { noTools?: "all" | "builtin"; tools?: string[] }) {
+		// Core integrations are environment-dependent (e.g. computer-use needs
+		// Wayland) — disable them so the expected tool lists stay deterministic.
+		writeFileSync(
+			join(agentDir, "settings.json"),
+			JSON.stringify({
+				todo: { enabled: false },
+				backgroundTasks: { enabled: false },
+				ssh: { enabled: false },
+				computerUse: { enabled: false },
+				subagents: { enabled: false },
+				recall: { enabled: false },
+			}),
+		);
 		const settingsManager = SettingsManager.create(tempDir, agentDir);
 		const sessionManager = SessionManager.inMemory(tempDir);
 		const resourceLoader = new DefaultResourceLoader({
@@ -78,7 +91,19 @@ describe("regression #3592: no-builtin-tools keeps extension tools enabled", () 
 				.getAllTools()
 				.map((tool) => tool.name)
 				.sort(),
-		).toEqual(["bash", "dynamic_tool", "edit", "find", "grep", "ls", "read", "write"]);
+		).toEqual([
+			"ask_user",
+			"bash",
+			"bg_kill",
+			"bg_output",
+			"bg_spawn",
+			"bg_status",
+			"dynamic_tool",
+			"edit",
+			"read",
+			"wait",
+			"write",
+		]);
 		expect(session.getActiveToolNames()).toEqual(["dynamic_tool"]);
 		expect(session.systemPrompt).toContain("- dynamic_tool: Run dynamic test behavior");
 		expect(session.systemPrompt).not.toContain("- read:");

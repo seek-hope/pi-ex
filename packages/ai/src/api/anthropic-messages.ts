@@ -463,6 +463,11 @@ async function* iterateSseMessages(
 			yield trailingEvent;
 		}
 	} finally {
+		// Aborting mid-stream must also cancel the underlying body read so the
+		// connection/socket is released promptly instead of lingering.
+		if (signal?.aborted) {
+			reader.cancel().catch(() => {});
+		}
 		reader.releaseLock();
 	}
 }

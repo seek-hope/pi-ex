@@ -146,7 +146,7 @@ describe("Unix transport conformance", () => {
 		const joining = await connect(server);
 		const hello = joining.hello();
 		await service.entered.promise;
-		await controller.request({ command: "attach", sessionId: "shared" });
+		await controller.request({ command: "attach", sessionId: "shared", leaseMode: "exclusive" });
 		service.release.resolve(undefined);
 		const handshake = await hello;
 		if (handshake.type !== "hello") throw new Error("Expected server hello");
@@ -181,11 +181,11 @@ describe("Unix transport conformance", () => {
 			ok: true,
 			result: { command: "list", sessions: [{ id: "first" }, { id: "second" }] },
 		});
-		expect(await client.request({ command: "attach", sessionId: "first" })).toMatchObject({
+		expect(await client.request({ command: "attach", sessionId: "first", leaseMode: "exclusive" })).toMatchObject({
 			ok: true,
 			result: { command: "attach", session: { id: "first", attached: true } },
 		});
-		expect(await client.request({ command: "attach", sessionId: "second" })).toMatchObject({
+		expect(await client.request({ command: "attach", sessionId: "second", leaseMode: "exclusive" })).toMatchObject({
 			ok: true,
 			result: { command: "attach", session: { id: "second", attached: true } },
 		});
@@ -203,7 +203,7 @@ describe("Unix transport conformance", () => {
 		service.latestRuntime("first").emitProgress(progress);
 		expect(await progressEvent).toEqual({
 			type: "event",
-			event: { type: "session_progress", sessionId: "first", progress },
+			event: { type: "session_progress", eventCursor: 1, sessionId: "first", progress },
 		});
 
 		expect(await client.request({ command: "detach", sessionId: "first" })).toMatchObject({
@@ -228,7 +228,7 @@ describe("Unix transport conformance", () => {
 		const { server } = await startServer(service, { onError: (error) => errors.push(error) });
 		const client = await connect(server);
 		await client.hello();
-		await client.request({ command: "attach", sessionId: "terminal" });
+		await client.request({ command: "attach", sessionId: "terminal", leaseMode: "exclusive" });
 		const runtime = service.latestRuntime("terminal");
 
 		runtime.setPhase("turn");
@@ -241,7 +241,9 @@ describe("Unix transport conformance", () => {
 
 		const nextClient = await connect(server);
 		await nextClient.hello();
-		expect(await nextClient.request({ command: "attach", sessionId: "terminal" })).toMatchObject({
+		expect(
+			await nextClient.request({ command: "attach", sessionId: "terminal", leaseMode: "exclusive" }),
+		).toMatchObject({
 			ok: true,
 			result: { command: "attach", session: { id: "terminal" } },
 		});
@@ -329,7 +331,7 @@ describe("Unix transport conformance", () => {
 		const delay = service.delayNextList();
 		const slow = client.request({ command: "list" }, "slow");
 		await delay.entered.promise;
-		const fast = client.request({ command: "attach", sessionId: "first" }, "fast");
+		const fast = client.request({ command: "attach", sessionId: "first", leaseMode: "exclusive" }, "fast");
 		expect(await fast).toMatchObject({ ok: true, id: "fast", result: { command: "attach" } });
 		expect(client.messages.some((message) => message.type === "response" && message.id === "slow")).toBe(false);
 
@@ -348,7 +350,7 @@ describe("Unix transport conformance", () => {
 		const socketPath = server.addresses[0];
 		const client = await connect(server);
 		await client.hello();
-		await client.request({ command: "attach", sessionId: "first" });
+		await client.request({ command: "attach", sessionId: "first", leaseMode: "exclusive" });
 		const runtime = service.latestRuntime("first");
 		const clientClosed = client.waitForClose();
 

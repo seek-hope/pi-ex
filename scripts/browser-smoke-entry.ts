@@ -1,4 +1,4 @@
-import { PiClient } from "@earendil-works/pi-client";
+import { PiClient, applyTranscriptSnapshot, createTranscriptState, selectTranscript } from "@earendil-works/pi-client";
 import { createAssistantMessageEventStream, Type } from "@earendil-works/pi-ai";
 import { complete, getModel, getProviders, streamSimple } from "@earendil-works/pi-ai/compat";
 import {
@@ -61,6 +61,46 @@ console.log(
 	toError("boom").message,
 	typeof streamProxy,
 	typeof PiClient,
+	transcriptSmoke(),
 	PROTOCOL_VERSION,
 	decodeCbor(encodeCbor({ browser: true })),
 );
+
+// Exercises the moved transcript reducer (browser-safe: pure JSON/structuredClone).
+function transcriptSmoke(): number {
+	const snapshot = {
+		id: "session-1",
+		cwd: "/workspace",
+		createdAt: 1,
+		updatedAt: 1,
+		phase: "idle" as const,
+		model: { provider: "faux", id: "faux-1" },
+		scopedModels: [{ provider: "faux", id: "faux-1" }],
+		thinkingLevel: "off" as const,
+		attached: true,
+		locked: true,
+		revision: 1,
+		eventCursor: 0,
+		lease: { exclusiveControllerConnected: true, observerCount: 0, mode: "exclusive" as const },
+		transcript: [
+			{
+				id: "assistant-1",
+				role: "assistant" as const,
+				content: [{ type: "text" as const, text: "saved" }],
+				status: "streaming" as const,
+				model: { provider: "faux", id: "faux-1" },
+				timestamp: 1,
+			},
+		],
+		queuedSteer: [],
+		queuedSteerCount: 0,
+		queuedFollowUp: [],
+		queuedFollowUpCount: 0,
+		steeringMode: "all" as const,
+		followUpMode: "all" as const,
+		surface: {},
+		pendingInteractions: [],
+	};
+	const next = applyTranscriptSnapshot(createTranscriptState(snapshot), { ...snapshot, revision: 2 });
+	return selectTranscript(next).length;
+}

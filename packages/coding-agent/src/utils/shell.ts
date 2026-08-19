@@ -119,7 +119,51 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 	return { shell: "sh", args: ["-c"] };
 }
 
-export function getShellEnv(): NodeJS.ProcessEnv {
+/**
+ * LLM provider secret env vars that must not leak into spawned bash child
+ * processes. The model could otherwise read them back into context via
+ * `env`/`echo $VAR`. Dev-tool credentials (GH_TOKEN, NPM_TOKEN, AWS_*) are
+ * intentionally NOT filtered here and remain available to commands.
+ */
+const PROVIDER_SECRET_ENV_VARS = new Set([
+	"ANTHROPIC_API_KEY",
+	"ANTHROPIC_AUTH_TOKEN",
+	"OPENAI_API_KEY",
+	"AZURE_OPENAI_API_KEY",
+	"GEMINI_API_KEY",
+	"GOOGLE_API_KEY",
+	"DEEPSEEK_API_KEY",
+	"MISTRAL_API_KEY",
+	"GROQ_API_KEY",
+	"OPENROUTER_API_KEY",
+	"XAI_API_KEY",
+	"TOGETHER_API_KEY",
+	"FIREWORKS_API_KEY",
+	"PERPLEXITY_API_KEY",
+	"MOONSHOT_API_KEY",
+	"KIMI_API_KEY",
+	"DASHSCOPE_API_KEY",
+	"MINIMAX_API_KEY",
+	"HF_TOKEN",
+	"HUGGING_FACE_HUB_TOKEN",
+	"VOYAGE_API_KEY",
+	"COHERE_API_KEY",
+]);
+
+/** Prefix match for AWS Bedrock credential vars (AWS_BEDROCK_*). */
+const AWS_BEDROCK_ENV_PREFIX = "AWS_BEDROCK_";
+
+function isProviderSecretEnvVar(name: string): boolean {
+	return PROVIDER_SECRET_ENV_VARS.has(name) || name.startsWith(AWS_BEDROCK_ENV_PREFIX);
+}
+
+/**
+ * Build the environment for spawned child processes (PATH updated to include
+ * the bin dir). By default LLM provider secret env vars are filtered out so
+ * they cannot be observed by the model; pass `{ exposeProviderSecrets: true }`
+ * to opt into the previous behavior of passing the full environment through.
+ */
+export function getShellEnv(options: { exposeProviderSecrets?: boolean } = {}): NodeJS.ProcessEnv {
 	const binDir = getBinDir();
 	const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
 	const currentPath = process.env[pathKey] ?? "";
@@ -127,10 +171,21 @@ export function getShellEnv(): NodeJS.ProcessEnv {
 	const hasBinDir = pathEntries.includes(binDir);
 	const updatedPath = hasBinDir ? currentPath : [binDir, currentPath].filter(Boolean).join(delimiter);
 
-	return {
+	const env: NodeJS.ProcessEnv = {
 		...process.env,
 		[pathKey]: updatedPath,
 	};
+
+	if (options.exposeProviderSecrets) {
+		return env;
+	}
+
+	for (const key of Object.keys(env)) {
+		if (isProviderSecretEnvVar(key)) {
+			delete env[key];
+		}
+	}
+	return env;
 }
 
 /**

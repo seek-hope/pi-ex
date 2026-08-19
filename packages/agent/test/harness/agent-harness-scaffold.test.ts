@@ -131,11 +131,6 @@ describe("AgentHarness v2 scaffold", () => {
 		retryPolicy.maxRetries = 99;
 		expect(await harness.getRetryPolicy()).toEqual({ enabled: true, maxRetries: 2, baseDelayMs: 10 });
 
-		const compactionSettings = { enabled: false, reserveTokens: 1, keepRecentTokens: 2 };
-		await harness.setCompactionSettings(compactionSettings);
-		compactionSettings.reserveTokens = 99;
-		expect(await harness.getCompactionSettings()).toEqual({ enabled: false, reserveTokens: 1, keepRecentTokens: 2 });
-
 		await harness.setSteeringMode("all");
 		expect(await harness.getSteeringMode()).toBe("all");
 		await harness.setFollowUpMode("all");

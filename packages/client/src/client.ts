@@ -60,6 +60,7 @@ export class PiClient {
 	readonly #sessionDetachments = new Map<string, Promise<void>>();
 	readonly #sessionCleanupRequired = new Set<string>();
 	readonly #sessionReconciliations = new Map<string, Promise<void>>();
+	readonly #sessionResyncs = new Map<string, Promise<void>>();
 	readonly #connectionStateListeners = new Set<(change: ConnectionStateChange) => void>();
 	#requestSequence = 0;
 	#disposed = false;
@@ -71,7 +72,9 @@ export class PiClient {
 		this.#connection = new Connection({
 			transportFactory: options.transportFactory,
 			maxFrameLength: options.maxFrameLength,
-			onHandshake: (snapshot) => this.#state.applyServerSnapshot(snapshot),
+			onHandshake: (snapshot) => {
+				if (this.#state.applyServerSnapshot(snapshot)) this.#invalidateAllSessionLeases();
+			},
 			onMessage: (message) => this.#handleMessage(message),
 			onStateChange: (change) => this.#handleConnectionStateChange(change),
 		});
@@ -138,9 +141,24 @@ export class PiClient {
 		return (await this.#request({ command: "list" })).sessions;
 	}
 
+	/**
+	 * Send an arbitrary protocol command, including session-less `free`
+	 * commands (`get_settings`/`set_setting`/`login`/`logout`/`import_session`)
+	 * that no session handle can carry. Session-scoped commands should
+	 * normally go through a `PiSessionHandle` (which enforces lease gating);
+	 * this is the raw path for everything else.
+	 */
+	async request<const TCommand extends Command>(command: TCommand): Promise<ResultForCommand<TCommand>> {
+		return this.#request(command);
+	}
+
 	async createSession(options: CreateSessionOptions = {}): Promise<PiSessionHandle> {
-		const result = await this.#request({ command: "create", ...options });
-		const token = this.#reserveSessionLease(result.session.id, "exclusive");
+		return this.createSessionWithMode(options, "exclusive");
+	}
+
+	async createSessionWithMode(options: CreateSessionOptions, mode: SessionLeaseMode): Promise<PiSessionHandle> {
+		const result = await this.#request({ command: "create", leaseMode: mode, ...options });
+		const token = this.#reserveSessionLease(result.session.id, mode);
 		return this.#createSessionLease(result.session.id, token);
 	}
 
@@ -160,7 +178,7 @@ export class PiClient {
 			if (reconciled || !this.#state.isSessionAttached(sessionId)) {
 				let attachment = this.#sessionAttachments.get(sessionId);
 				if (!attachment) {
-					attachment = this.#attachSession(sessionId);
+					attachment = this.#attachSession(sessionId, options.mode);
 					this.#sessionAttachments.set(sessionId, attachment);
 				}
 				try {
@@ -176,10 +194,10 @@ export class PiClient {
 		}
 	}
 
-	async #attachSession(sessionId: string): Promise<void> {
+	async #attachSession(sessionId: string, mode: SessionLeaseMode): Promise<void> {
 		const previous = this.#state.forgetSessionSnapshot(sessionId);
 		try {
-			await this.#request({ command: "attach", sessionId });
+			await this.#request({ command: "attach", sessionId, leaseMode: mode });
 		} catch (error) {
 			if (previous) this.#state.restoreSessionSnapshot(previous);
 			throw error;
@@ -223,10 +241,21 @@ export class PiClient {
 			refreshState();
 			return state === "active" && this.#state.isSessionAttached(sessionId);
 		};
+		const resolveMode = (): SessionLeaseMode | undefined => {
+			const snapshot = this.#state.getSessionSnapshot(sessionId);
+			if (snapshot?.lease.mode) return snapshot.lease.mode;
+			return token.mode;
+		};
 		const assertActive = () => {
 			this.#assertNotDisposed();
 			if (!this.connected) throw new PiDisconnectedError();
 			if (!isActive()) throw new PiSessionDetachedError(sessionId);
+		};
+		const assertController = () => {
+			assertActive();
+			if (resolveMode() !== "exclusive") {
+				throw new PiSessionOwnershipError(sessionId, `Session ${sessionId} is not exclusively controlled`);
+			}
 		};
 		const release = (relinquishOnFailure: boolean): Promise<void> => {
 			refreshState();
@@ -268,6 +297,7 @@ export class PiClient {
 		};
 		const callbacks: SessionHandleCallbacks = {
 			isAttached: isActive,
+			getMode: resolveMode,
 			getSnapshot: () => (isActive() ? this.#state.getSessionSnapshot(sessionId) : undefined),
 			subscribe: (listener) => {
 				assertActive();
@@ -287,14 +317,24 @@ export class PiClient {
 				assertActive();
 				return this.#request(command);
 			},
+			assertController,
 		};
 		return new SessionHandle(sessionId, callbacks);
 	}
 
 	#handleMessage(message: ResponseEnvelope | EventEnvelope): void {
 		if (message.type === "event") {
-			if (message.event.type === "session_removed") this.#invalidateSessionLeases(message.event.sessionId);
-			this.#state.applyEvent(message.event);
+			if (message.event.type === "session_removed" || message.event.type === "lease_lost") {
+				this.#invalidateSessionLeases(message.event.sessionId);
+			}
+			if (message.event.type === "server_snapshot") {
+				const previous = this.#state.snapshot?.serverId;
+				if (previous !== undefined && message.event.snapshot.serverId !== previous) {
+					this.#invalidateAllSessionLeases();
+				}
+			}
+			const signal = this.#state.applyEvent(message.event);
+			for (const sessionId of signal.sessionIds) this.#scheduleResync(sessionId);
 			return;
 		}
 		const pending = this.#takePendingRequest(message.id);
@@ -318,10 +358,35 @@ export class PiClient {
 		pending.resolve(message.result);
 	}
 
+	#scheduleResync(sessionId: string): void {
+		if (this.#sessionResyncs.has(sessionId) || this.#disposed || !this.connected) return;
+		let failure: Error | undefined;
+		let tracked: Promise<void>;
+		tracked = this.#request({ command: "resync", sessionId })
+			.then(() => undefined)
+			.catch((error: unknown) => {
+				failure = toError(error);
+			})
+			.finally(() => {
+				// A disconnected generation can settle after a new generation starts;
+				// only the promise still registered for this session may mutate state.
+				if (this.#sessionResyncs.get(sessionId) !== tracked) return;
+				this.#sessionResyncs.delete(sessionId);
+				if (failure) {
+					// Retain the stale snapshot/cursor but clear the gap only after the
+					// in-flight marker is gone, so the next event can reliably retry.
+					this.#state.clearGap(sessionId);
+					this.#reportListenerError(failure);
+				}
+			});
+		this.#sessionResyncs.set(sessionId, tracked);
+	}
+
 	#handleConnectionStateChange(change: ConnectionStateChange): void {
 		if (change.state === "disconnected") {
 			this.#state.clearAttachments();
 			this.#invalidateAllSessionLeases();
+			this.#sessionResyncs.clear();
 			this.#rejectPendingRequests(change.error ?? new PiDisconnectedError());
 		}
 		this.#notifyConnectionStateListeners(change);
@@ -348,6 +413,7 @@ export class PiClient {
 		this.#connection.disconnect(error);
 		this.#state.dispose();
 		this.#invalidateAllSessionLeases();
+		this.#sessionResyncs.clear();
 		this.#connectionStateListeners.clear();
 		return this.#disposePromise;
 	}

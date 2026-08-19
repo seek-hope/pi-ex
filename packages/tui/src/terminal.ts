@@ -202,6 +202,16 @@ export class ProcessTerminal implements Terminal {
 	 * to handle the case where the response arrives split across multiple events.
 	 */
 	private setupStdinBuffer(): void {
+		// Idempotency: re-running start() (e.g. after resume / re-init) must not
+		// stack a second "data" listener. Remove any previously-installed handler
+		// before wiring a fresh one, so only one feeds the buffer.
+		if (this.stdinDataHandler) {
+			process.stdin.removeListener("data", this.stdinDataHandler);
+			this.stdinDataHandler = undefined;
+		}
+		if (this.stdinBuffer) {
+			this.stdinBuffer.destroy();
+		}
 		this.stdinBuffer = new StdinBuffer({ escapeTimeout: resolveEscapeTimeoutMs() });
 
 		// Forward individual sequences to the input handler

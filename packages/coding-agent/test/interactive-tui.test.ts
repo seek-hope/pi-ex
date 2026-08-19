@@ -150,7 +150,7 @@ describe("InteractiveMode right-click paste", () => {
 });
 
 type CopyCommandContext = {
-	session: { getLastAssistantText: () => string | undefined };
+	controller: { getLastAssistantText: () => string | undefined };
 	ui: ReturnType<typeof createInteractiveTui>;
 	showStatus: (message: string) => void;
 	showError: (message: string) => void;
@@ -181,7 +181,7 @@ describe("InteractiveMode copy confirmation", () => {
 		const showStatus = vi.fn();
 		const showError = vi.fn();
 		const context: CopyCommandContext = {
-			session: { getLastAssistantText: () => "assistant response" },
+			controller: { getLastAssistantText: () => "assistant response" },
 			ui,
 			showStatus,
 			showError,
@@ -212,7 +212,7 @@ describe("InteractiveMode copy confirmation", () => {
 		const showStatus = vi.fn();
 		const showError = vi.fn();
 		const context: CopyCommandContext = {
-			session: { getLastAssistantText: () => "assistant response" },
+			controller: { getLastAssistantText: () => "assistant response" },
 			ui,
 			showStatus,
 			showError,

@@ -2,8 +2,8 @@
  * Custom Compaction Extension
  *
  * Replaces the default compaction behavior with a full summary of the entire context.
- * Instead of keeping the last 20k tokens of conversation turns, this extension:
- * 1. Summarizes ALL messages (messagesToSummarize + turnPrefixMessages)
+ * Instead of keeping the last conversation rounds, this extension:
+ * 1. Summarizes ALL messages (messagesToSummarize)
  * 2. Discards all old turns completely, keeping only the summary
  *
  * This example also demonstrates using a different model (Gemini Flash) for summarization,
@@ -22,7 +22,7 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify("Custom compaction extension triggered", "info");
 
 		const { preparation, branchEntries: _, signal } = event;
-		const { messagesToSummarize, turnPrefixMessages, tokensBefore, firstKeptEntryId, previousSummary } = preparation;
+		const { messagesToSummarize, tokensBefore, firstKeptEntryId, previousSummary } = preparation;
 
 		// Use Gemini Flash for summarization (cheaper/faster than most conversation models)
 		const model = ctx.modelRegistry.find("google", "gemini-2.5-flash");
@@ -32,7 +32,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// Combine all messages for full summary
-		const allMessages = [...messagesToSummarize, ...turnPrefixMessages];
+		const allMessages = [...messagesToSummarize];
 
 		ctx.ui.notify(
 			`Custom compaction: summarizing ${allMessages.length} messages (${tokensBefore.toLocaleString()} tokens) with ${model.id}...`,

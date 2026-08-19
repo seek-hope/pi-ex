@@ -146,6 +146,7 @@ export class ModelRuntime implements Models {
 		auth: new Map(),
 	};
 	private availabilityRefreshSeq = 0;
+	private availabilityRefreshPromise: Promise<void> | undefined;
 	private availabilityErrorSeq = 0;
 	private readonly providerAvailabilitySeq = new Map<string, number>();
 	private availabilityError: string | undefined;
@@ -313,19 +314,41 @@ export class ModelRuntime implements Models {
 		if (errorSeq === this.availabilityErrorSeq) this.availabilityError = undefined;
 	}
 
-	private queueAvailabilityRefresh(signal?: AbortSignal): Promise<void> {
+	private queueAvailabilityRefresh(signal?: AbortSignal, options?: { coalesce?: boolean }): Promise<void> {
+		// Coalesce concurrent full passes: each one is a network catalog pull plus
+		// an auth check per provider, so joining an in-flight pass is much cheaper
+		// than N parallel copies. Explicit refreshes (recovery after a credential
+		// change) opt out: the in-flight pass may be stalled, and joining it would
+		// both hang the caller and skip the recovery pass. The seq counter makes
+		// the older pass a no-op when it finally settles.
+		if (options?.coalesce !== false && this.availabilityRefreshPromise) {
+			return this.availabilityRefreshPromise;
+		}
 		const seq = ++this.availabilityRefreshSeq;
 		for (const [providerId, providerSeq] of this.providerAvailabilitySeq) {
 			this.providerAvailabilitySeq.set(providerId, providerSeq + 1);
 		}
 		const errorSeq = ++this.availabilityErrorSeq;
 		const effectiveSignal = operationSignal(signal);
-		return this.runAvailabilityRefresh(seq, errorSeq, effectiveSignal).catch((error) => {
+		const promise = this.runAvailabilityRefresh(seq, errorSeq, effectiveSignal).catch((error) => {
 			if (errorSeq === this.availabilityErrorSeq && !effectiveSignal.aborted) {
 				this.availabilityError = error instanceof Error ? error.message : String(error);
 			}
 			throw error;
 		});
+		this.availabilityRefreshPromise = promise;
+		// Clear the in-flight slot when the pass settles. `.then(onOk, onErr)`
+		// instead of `.finally()`: finally would hand an unhandled rejection to
+		// the discarded derived promise when the pass fails.
+		void promise.then(
+			() => {
+				if (this.availabilityRefreshPromise === promise) this.availabilityRefreshPromise = undefined;
+			},
+			() => {
+				if (this.availabilityRefreshPromise === promise) this.availabilityRefreshPromise = undefined;
+			},
+		);
+		return promise;
 	}
 
 	private async refreshProviderAvailability(providerId: string, signal: AbortSignal): Promise<void> {
@@ -722,7 +745,10 @@ export class ModelRuntime implements Models {
 			);
 		} else {
 			try {
-				await this.queueAvailabilityRefresh(options.signal);
+				// Do not coalesce: this is an explicit refresh (recovery), it must
+				// run its own pass even if another one is in flight (possibly
+				// stalled).
+				await this.queueAvailabilityRefresh(options.signal, { coalesce: false });
 			} catch {
 				// Availability errors are recorded by the latest pass; refreshed models remain usable.
 			}
@@ -774,7 +800,12 @@ export class ModelRuntime implements Models {
 				available: this.snapshot.all.filter((model) => configuredProviders.has(model.provider)),
 			};
 		}
-		void this.refresh({ allowNetwork: false });
+		// Fire-and-forget model refresh; record a rejected refresh instead of silently
+		// swallowing it. We never rethrow from here — registerProvider itself already
+		// succeeded and the provisional provider entry above remains usable.
+		void this.refresh({ allowNetwork: false }).catch((error: unknown) => {
+			console.error(`[model-runtime] refresh after registerProvider(${providerId}) failed:`, error);
+		});
 	}
 
 	unregisterProvider(providerId: string): void {

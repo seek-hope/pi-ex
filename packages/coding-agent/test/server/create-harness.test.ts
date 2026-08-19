@@ -51,7 +51,7 @@ function createPromptTool(name: string, promptSnippet?: string, promptGuidelines
 
 const defaultPromptTools = [
 	createPromptTool("read", "Read file contents", ["Use read to examine files instead of cat or sed."]),
-	createPromptTool("bash", "Execute bash commands (ls, grep, find, etc.)", [
+	createPromptTool("bash", "Execute bash commands (ls, rg, find, etc.)", [
 		"You can inspect PI_* environment variables for current model and session details.",
 	]),
 	createPromptTool("edit", "Edit files", ["Edit carefully."]),
@@ -94,7 +94,7 @@ describe("coding-agent Harness construction", () => {
 			activeToolNames: ["read", "bash", "edit", "write"],
 		});
 		expect(prompt).toContain("- read: Read file contents");
-		expect(prompt).toContain("- bash: Execute bash commands (ls, grep, find, etc.)");
+		expect(prompt).toContain("- bash: Execute bash commands (ls, rg, find, etc.)");
 		expect(prompt).toContain("Use read to examine files instead of cat or sed.");
 		expect(prompt).toContain("You can inspect PI_* environment variables for current model and session details.");
 		expect(prompt.indexOf("Use read to examine files")).toBeLessThan(
@@ -235,7 +235,7 @@ describe("coding-agent Harness construction", () => {
 			try {
 				const initialPrompt = await resolveSystemPrompt(configuredSystemPrompt);
 				expect(initialPrompt).toContain("- read: Read file contents");
-				expect(initialPrompt).toContain("- bash: Execute bash commands (ls, grep, find, etc.)");
+				expect(initialPrompt).toContain("- bash: Execute bash commands (ls, rg, find, etc.)");
 				expect(initialPrompt).toContain("- edit: Make precise file edits with exact text replacement");
 				expect(initialPrompt).toContain("- write: Create or overwrite files");
 
@@ -289,7 +289,7 @@ describe("coding-agent Harness construction", () => {
 	test.each([
 		[
 			"bash",
-			"Execute bash commands (ls, grep, find, etc.)",
+			"Execute bash commands (ls, rg, find, etc.)",
 			"You can inspect PI_* environment variables for current model and session details.",
 		],
 		["read", "Read file contents", "Use read to examine files instead of cat or sed."],

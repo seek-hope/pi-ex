@@ -67,9 +67,18 @@ export async function executeBashWithOperations(
 		}
 		const id = randomBytes(8).toString("hex");
 		tempFilePath = join(tmpdir(), `pi-bash-${id}.log`);
-		tempFileStream = createWriteStream(tempFilePath);
+		// 0600 so other local users cannot read truncated output (may contain secrets).
+		const stream = createWriteStream(tempFilePath, { mode: 0o600 });
+		tempFileStream = stream;
+		stream.on("error", (err) => {
+			// Disk full / permissions: an unhandled WriteStream error would crash
+			// the process — degrade to the in-memory rolling buffer instead.
+			console.error(`bash-executor: temp output file ${tempFilePath} failed: ${err.message}`);
+			tempFileStream = undefined;
+			tempFilePath = undefined;
+		});
 		for (const chunk of outputChunks) {
-			tempFileStream.write(chunk);
+			stream.write(chunk);
 		}
 	};
 

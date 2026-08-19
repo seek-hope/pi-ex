@@ -57,6 +57,11 @@ export function createProjectTrustContext(options: {
 					console.error(color(message));
 				}
 			},
+			// Unsupported editor/surface operations are inert outside interactive mode.
+			editor: async () => undefined,
+			setStatus: () => {},
+			setWidget: () => {},
+			setTitle: () => {},
 		},
 	};
 }

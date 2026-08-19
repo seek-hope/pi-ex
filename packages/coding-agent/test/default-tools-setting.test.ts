@@ -4,110 +4,109 @@ import { join } from "node:path";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createAgentSessionFromServices, createAgentSessionServices } from "../src/core/agent-session-services.ts";
-import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
-import { type CreateAgentSessionOptions, createAgentSession, type InlineExtension } from "../src/core/sdk.ts";
+import { createAgentSessionFromServices, createAgentSessionServices } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
-import { SettingsManager } from "../src/core/settings-manager.ts";
 
-type ToolOptions = Pick<CreateAgentSessionOptions, "tools" | "excludeTools" | "noTools" | "customTools">;
+// Fork note: this fork's built-in registry is read/bash/edit/write/ask_user/wait
+// (plus integration tools), not upstream's read/bash/edit/write/grep/find/ls —
+// so the configured lists below use this fork's inventory, and the all-tools
+// assertions are containment checks instead of upstream's exact 7-tool list.
 
 describe("defaultTools setting", () => {
-	let tempDir: string;
-	let agentDir: string;
+	let tempDir = "";
 
 	beforeEach(() => {
 		tempDir = join(tmpdir(), `pi-default-tools-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-		agentDir = join(tempDir, "agent");
-		mkdirSync(agentDir, { recursive: true });
+		mkdirSync(tempDir, { recursive: true });
 	});
 
 	afterEach(() => {
-		if (tempDir && existsSync(tempDir)) {
-			rmSync(tempDir, { recursive: true, force: true });
-		}
+		if (tempDir && existsSync(tempDir)) rmSync(tempDir, { recursive: true });
 	});
 
 	async function createSession(
-		defaultTools: string[],
-		options: ToolOptions = {},
-		extensionFactories: InlineExtension[] = [],
+		defaultTools: string[] | undefined,
+		options: {
+			customTools?: Array<{
+				name: string;
+				label: string;
+				description: string;
+				parameters: import("typebox").TObject;
+				execute: (...args: never[]) => Promise<{
+					content: Array<{ type: "text"; text: string }>;
+					details: Record<string, never>;
+				}>;
+			}>;
+			tools?: string[];
+			excludeTools?: string[];
+			noTools?: "all";
+		} = {},
 	) {
-		const settingsManager = SettingsManager.inMemory({ defaultTools });
-		const resourceLoader = new DefaultResourceLoader({
+		const services = await createAgentSessionServices({
 			cwd: tempDir,
-			agentDir,
-			settingsManager,
-			extensionFactories,
+			agentDir: join(tempDir, "agent"),
 		});
-		await resourceLoader.reload();
-
+		services.settingsManager.applyOverrides(defaultTools ? { defaultTools } : {});
 		return (
-			await createAgentSession({
-				cwd: tempDir,
-				agentDir,
-				model: getModel("anthropic", "claude-sonnet-4-5")!,
-				settingsManager,
-				sessionManager: SessionManager.inMemory(tempDir),
-				resourceLoader,
+			await createAgentSessionFromServices({
+				services,
+				sessionManager: SessionManager.inMemory(),
+				model: getModel("anthropic", "claude-sonnet-4-5"),
 				...options,
 			})
 		).session;
 	}
 
 	it("uses the configured list as the initial built-in selection", async () => {
-		const session = await createSession(["grep", "find"]);
+		const session = await createSession(["read", "bash"]);
 
-		expect(
-			session
-				.getAllTools()
-				.map((tool) => tool.name)
-				.sort(),
-		).toEqual(["bash", "edit", "find", "grep", "ls", "read", "write"]);
-		expect(session.getActiveToolNames()).toEqual(["grep", "find"]);
-		expect(session.systemPrompt).toContain("- grep:");
-		expect(session.systemPrompt).not.toContain("- read:");
+		expect(session.getAllTools().map((tool) => tool.name)).toEqual(
+			expect.arrayContaining(["read", "bash", "edit", "write", "ask_user", "wait"]),
+		);
+		expect(session.getActiveToolNames()).toEqual(["read", "bash"]);
+		expect(session.systemPrompt).toContain("Read file contents");
+		expect(session.systemPrompt).toContain("Execute bash commands");
+		expect(session.systemPrompt).not.toContain("Make precise file edits");
 		session.dispose();
 	});
 
 	it("keeps extension and SDK custom tools enabled", async () => {
-		const session = await createSession(
-			["grep"],
-			{
-				customTools: [
-					{
-						name: "sdk_tool",
-						label: "SDK Tool",
-						description: "SDK custom tool",
-						parameters: Type.Object({}),
-						execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+		const makeTool = (name: string) => ({
+			name,
+			label: name,
+			description: `${name} tool`,
+			parameters: Type.Object({}),
+			execute: async () => ({ content: [{ type: "text" as const, text: "ok" }], details: {} }),
+		});
+		// Fork note: extension tools are registered via extension factories
+		// (pi.registerTool on session_start), not by assigning session.extensions.
+		const services = await createAgentSessionServices({
+			cwd: tempDir,
+			agentDir: join(tempDir, "agent"),
+			resourceLoaderOptions: {
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_start", () => {
+							pi.registerTool(makeTool("dynamic_tool") as never);
+							pi.registerTool(makeTool("static_tool") as never);
+						});
 					},
 				],
 			},
-			[
-				(pi) => {
-					pi.registerTool({
-						name: "static_tool",
-						label: "Static Tool",
-						description: "Statically registered extension tool",
-						parameters: Type.Object({}),
-						execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
-					});
-					pi.on("session_start", () => {
-						pi.registerTool({
-							name: "dynamic_tool",
-							label: "Dynamic Tool",
-							description: "Dynamically registered extension tool",
-							parameters: Type.Object({}),
-							execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
-						});
-					});
-				},
-			],
-		);
+		});
+		services.settingsManager.applyOverrides({ defaultTools: ["read"] });
+		const session = (
+			await createAgentSessionFromServices({
+				services,
+				sessionManager: SessionManager.inMemory(),
+				model: getModel("anthropic", "claude-sonnet-4-5"),
+				customTools: [makeTool("sdk_tool") as never],
+			})
+		).session;
+
 		await session.bindExtensions({});
 
-		expect(session.getActiveToolNames().sort()).toEqual(["dynamic_tool", "grep", "sdk_tool", "static_tool"]);
+		expect(session.getActiveToolNames().sort()).toEqual(["dynamic_tool", "read", "sdk_tool", "static_tool"]);
 		expect(session.getAllTools().map((tool) => tool.name)).toEqual(
 			expect.arrayContaining(["read", "dynamic_tool", "sdk_tool", "static_tool"]),
 		);
@@ -115,36 +114,35 @@ describe("defaultTools setting", () => {
 	});
 
 	it("preserves explicit tool option precedence", async () => {
-		const allowlistedSession = await createSession(["grep"], { tools: ["read"] });
-		expect(allowlistedSession.getActiveToolNames()).toEqual(["read"]);
-		allowlistedSession.dispose();
+		const explicitTools = await createSession(["bash"], { tools: ["read"] });
+		expect(explicitTools.getActiveToolNames()).toEqual(["read"]);
+		explicitTools.dispose();
 
-		const excludedSession = await createSession(["read", "grep"], { excludeTools: ["read"] });
-		expect(excludedSession.getActiveToolNames()).toEqual(["grep"]);
-		excludedSession.dispose();
+		const excluded = await createSession(["read", "bash"], { excludeTools: ["read"] });
+		expect(excluded.getActiveToolNames()).toEqual(["bash"]);
+		excluded.dispose();
 
-		const toolLessSession = await createSession(["read"], { noTools: "all" });
-		expect(toolLessSession.getAllTools()).toEqual([]);
-		expect(toolLessSession.getActiveToolNames()).toEqual([]);
-		toolLessSession.dispose();
+		const none = await createSession(["read"], { noTools: "all" });
+		expect(none.getActiveToolNames()).toEqual([]);
+		none.dispose();
 	});
 
 	it("applies through service-based session creation", async () => {
-		const settingsManager = SettingsManager.inMemory({ defaultTools: ["ls"] });
-		const services = await createAgentSessionServices({ cwd: tempDir, agentDir, settingsManager });
+		const services = await createAgentSessionServices({
+			cwd: tempDir,
+			agentDir: join(tempDir, "agent"),
+		});
+		services.settingsManager.applyOverrides({ defaultTools: ["read"] });
 		const { session } = await createAgentSessionFromServices({
 			services,
-			sessionManager: SessionManager.inMemory(tempDir),
-			model: getModel("anthropic", "claude-sonnet-4-5")!,
+			sessionManager: SessionManager.inMemory(),
+			model: getModel("anthropic", "claude-sonnet-4-5"),
 		});
 
-		expect(
-			session
-				.getAllTools()
-				.map((tool) => tool.name)
-				.sort(),
-		).toEqual(["bash", "edit", "find", "grep", "ls", "read", "write"]);
-		expect(session.getActiveToolNames()).toEqual(["ls"]);
+		expect(session.getAllTools().map((tool) => tool.name)).toEqual(
+			expect.arrayContaining(["read", "bash", "edit", "write", "ask_user", "wait"]),
+		);
+		expect(session.getActiveToolNames()).toEqual(["read"]);
 		session.dispose();
 	});
 });

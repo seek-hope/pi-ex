@@ -1,0 +1,247 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # Every 5 minutes (GitHub's minimum interval)
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          # Do NOT persist the GITHUB_TOKEN: its Authorization header would
+          # override the PAT credential helper on every push, and GitHub
+          # rejects App-token pushes that touch workflow files.
+          persist-credentials: false
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config rerere.enabled true
+
+      - name: Restore rerere cache
+        uses: actions/cache@v4
+        with:
+          path: .git/rr-cache
+          key: sync-upstream-rr-cache
+          restore-keys: |
+            sync-upstream-rr-cache
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/earendil-works/pi-mono.git
+          git fetch upstream main
+          git fetch origin upstream-image 2>/dev/null || true
+
+      - name: Check for changes
+        id: check
+        run: |
+          git fetch origin upstream-image 2>/dev/null || true
+          UPSTREAM=$(git rev-parse upstream/main)
+          IMAGE=$(git rev-parse origin/upstream-image 2>/dev/null || echo "")
+          MAIN=$(git rev-parse origin/main)
+
+          if [ "$UPSTREAM" != "$IMAGE" ]; then
+            COUNT=$(git rev-list --count "$IMAGE..$UPSTREAM" 2>/dev/null || echo "initial")
+            echo "Detected $COUNT new upstream commit(s): $IMAGE → $UPSTREAM"
+            echo "upstream_changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "upstream-image is up-to-date with upstream/main ($UPSTREAM)."
+            echo "upstream_changed=false" >> $GITHUB_OUTPUT
+          fi
+          # Always available for the conflict report, whatever the trigger path.
+          echo "upstream_sha=$UPSTREAM" >> $GITHUB_OUTPUT
+
+          # Check if main has fallen behind upstream-image (e.g. after manual pointer fixes).
+          BASE=$(git merge-base "$MAIN" "$IMAGE" 2>/dev/null || echo "")
+          if [ "$BASE" != "$IMAGE" ]; then
+            BEHIND=$(git rev-list --count "$BASE..$IMAGE" 2>/dev/null || echo "?")
+            echo "main is $BEHIND commit(s) behind upstream-image. Will squash fork work onto it."
+            echo "main_behind=true" >> $GITHUB_OUTPUT
+          else
+            echo "main is based on upstream-image."
+            echo "main_behind=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Verify upstream CI status
+        id: verify
+        if: steps.check.outputs.upstream_changed == 'true'
+        run: |
+          UPSTREAM="${{ steps.check.outputs.upstream_sha }}"
+
+          CI_STATE=$(gh api \
+            /repos/earendil-works/pi-mono/commits/${UPSTREAM}/check-runs \
+            -H "Accept: application/vnd.github+json" \
+            --jq '[.check_runs[] | select(.name == "build-check-test")] | if length == 0 then "none" else .[0].conclusion end' 2>/dev/null || echo "unknown")
+
+          echo "Upstream CI (build-check-test) for ${UPSTREAM}: ${CI_STATE}"
+
+          case "$CI_STATE" in
+            success)
+              echo "CI verified. Proceeding with sync."
+              echo "verified=true" >> $GITHUB_OUTPUT
+              ;;
+            none|"")
+              echo "No CI check runs found (likely a merge commit where CI ran on the branch). Proceeding."
+              echo "verified=true" >> $GITHUB_OUTPUT
+              ;;
+            failure|cancelled|timed_out|action_required)
+              echo "CI failed (${CI_STATE}). Skipping until upstream is green."
+              echo "verified=false" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "CI still running (${CI_STATE}). Will retry on next check."
+              echo "verified=false" >> $GITHUB_OUTPUT
+              ;;
+          esac
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure push credentials
+        # GitHub refuses GitHub-App tokens (GITHUB_TOKEN) for pushes that
+        # create/update workflow files; upstream added approve-contributor.yml,
+        # so pushes need a PAT with the `workflow` scope (secret SYNC_PAT).
+        run: |
+          if [ -n "$SYNC_PAT" ]; then
+            git config --global credential.helper store
+            echo "https://x-access-token:${SYNC_PAT}@github.com" > "$HOME/.git-credentials"
+          fi
+        env:
+          SYNC_PAT: ${{ secrets.SYNC_PAT }}
+
+      - name: Squash fork work onto upstream-image
+        id: rebase
+        if: (steps.check.outputs.upstream_changed == 'true' && steps.verify.outputs.verified == 'true') || steps.check.outputs.main_behind == 'true'
+        run: |
+          # upstream-image serves both as the squash target and the change-detection pointer.
+          git checkout -B upstream-image upstream/main
+          git push origin upstream-image --force-with-lease
+
+          git checkout main
+          # 3-way squash: replay main's fork work (relative to its merge base
+          # with upstream-image) as a single commit on top of the new upstream.
+          # Unlike a commit-by-commit rebase, this never replays the whole fork
+          # history and keeps main a direct descendant of upstream-image.
+          if git merge --squash origin/upstream-image; then
+            if git diff --cached --quiet; then
+              # Nothing to squash: main already contains everything upstream has.
+              echo "rebase_success=true" >> $GITHUB_OUTPUT
+            else
+              # Re-parent the squash result onto upstream-image so main stays a
+              # direct descendant of the tracking branch (GitHub then shows
+              # 'ahead N, behind 0' instead of a diverged history).
+              git reset --soft origin/upstream-image
+              git commit -m "squash: fork work onto upstream ${{ steps.check.outputs.upstream_sha }}"
+              echo "rebase_success=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "rebase_success=false" >> $GITHUB_OUTPUT
+            # A conflicted `merge --squash` writes no MERGE_HEAD, so
+            # `git merge --abort` fails with "MERGE_HEAD missing" and crashes
+            # the step before the conflict report can be filed. `reset --merge`
+            # is the correct cleanup for a conflicted squash; the hard reset is
+            # a fallback (the CI runner is disposable).
+            git reset --merge || git reset --hard HEAD
+          fi
+
+      - name: Push main
+        if: steps.rebase.outputs.rebase_success == 'true'
+        run: |
+          git push origin main --force-with-lease
+
+      - name: Close stale conflict reports on success
+        if: steps.rebase.outputs.rebase_success == 'true'
+        continue-on-error: true
+        uses: actions/github-script@v9
+        with:
+          script: |
+            // The squash succeeded — any open [upstream-sync] conflict issue is
+            // stale now. Without this, a resolved conflict left its issue open
+            // until the next failure happened to run the dedup.
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-sync',
+            });
+            for (const issue of existing.data) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+            }
+
+      - name: Report conflict
+        # always(): even if the rebase step crashes unexpectedly after writing
+        # its output, the conflict must still be reported instead of the run
+        # dying silently with a raw step failure.
+        if: always() && steps.rebase.outputs.rebase_success == 'false'
+        continue-on-error: true
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const upstreamSha = '${{ steps.check.outputs.upstream_sha }}'.substring(0, 8);
+            // A fresh conflict supersedes any stale conflict reports — close
+            // existing open [upstream-sync] issues before filing a new one so
+            // they cannot pile up (a successful sync has no cleanup step).
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-sync',
+            });
+            for (const issue of existing.data) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+            }
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[upstream-sync] Sync conflict at upstream ${upstreamSha}`,
+              body: [
+                '## Upstream sync failed: squash-merge conflict',
+                '',
+                '`main` could not be squashed onto the new upstream. Manual resolution required.',
+                '',
+                '### Steps to resolve',
+                '',
+                '```bash',
+                'git checkout main',
+                'git fetch upstream',
+                'git merge --squash origin/upstream-image',
+                '# resolve conflicts, then:',
+                'git commit -m "squash: fork work onto upstream <sha>"',
+                'git push --force-with-lease origin main',
+                '# update the tracking branch:',
+                'git push origin upstream/main:refs/heads/upstream-image --force-with-lease',
+                '```',
+                '',
+                'Or run `scripts/sync-upstream.sh`, resolve the conflicts, then',
+                '`scripts/sync-upstream.sh --continue` (it squashes, verifies and',
+                'pushes).',
+                '',
+                '> Triggered by [`sync-upstream.yml`](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/workflows/sync-upstream.yml).',
+              ].join('\n'),
+              labels: ['upstream-sync'],
+            });
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

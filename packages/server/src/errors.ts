@@ -2,7 +2,7 @@ import type { JsonValue, ProtocolErrorCode } from "@earendil-works/pi-protocol";
 
 export type PiServerOperationErrorCode = Extract<
 	ProtocolErrorCode,
-	"busy" | "session_locked" | "not_found" | "invalid_request" | "not_implemented"
+	"busy" | "session_locked" | "not_found" | "invalid_request" | "not_implemented" | "unauthorized"
 >;
 
 export const INTERNAL_SERVER_ERROR_MESSAGE = "Internal server error";

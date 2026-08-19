@@ -31,7 +31,7 @@ describe("#6647 compaction retries transient summarization failures", () => {
 	}
 
 	function seedCompactableSession(harness: Harness): void {
-		harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
+		harness.settingsManager.applyOverrides({ compaction: { keepRecentRounds: 1 } });
 		const now = Date.now();
 		harness.sessionManager.appendMessage({
 			role: "user",
@@ -48,6 +48,22 @@ describe("#6647 compaction retries transient summarization failures", () => {
 		};
 		assistant.content = [{ type: "text", text: "assistant response to compact" }];
 		harness.sessionManager.appendMessage(assistant);
+		// Second round: with keepRecentRounds: 1 only the last round is kept, so
+		// the first round is what gets summarized.
+		harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "message to compact 2" }],
+			timestamp: now - 300,
+		});
+		const assistant2: AssistantMessage = {
+			...fauxAssistantMessage("", { stopReason: "stop", timestamp: now - 100 }),
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: createUsage(100),
+		};
+		assistant2.content = [{ type: "text", text: "assistant response to compact 2" }];
+		harness.sessionManager.appendMessage(assistant2);
 		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 	}
 
@@ -80,7 +96,10 @@ describe("#6647 compaction retries transient summarization failures", () => {
 	}
 
 	it("retries a transient `terminated` summarization error and compacts successfully", async () => {
-		const harness = await createHarness({ withConfiguredAuth: false });
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			settings: { compaction: { quality: "standard" } },
+		});
 		harnesses.push(harness);
 		seedCompactableSession(harness);
 		harness.settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 3, baseDelayMs: 0 } });
@@ -112,7 +131,10 @@ describe("#6647 compaction retries transient summarization failures", () => {
 	});
 
 	it("does not retry a non-retryable error (insufficient_quota)", async () => {
-		const harness = await createHarness({ withConfiguredAuth: false });
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			settings: { compaction: { quality: "standard" } },
+		});
 		harnesses.push(harness);
 		seedCompactableSession(harness);
 		harness.settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 3, baseDelayMs: 0 } });
@@ -129,7 +151,10 @@ describe("#6647 compaction retries transient summarization failures", () => {
 	});
 
 	it("does not retry when retry is disabled", async () => {
-		const harness = await createHarness({ withConfiguredAuth: false });
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			settings: { compaction: { quality: "standard" } },
+		});
 		harnesses.push(harness);
 		seedCompactableSession(harness);
 		harness.settingsManager.applyOverrides({ retry: { enabled: false, maxRetries: 3, baseDelayMs: 0 } });
@@ -146,7 +171,10 @@ describe("#6647 compaction retries transient summarization failures", () => {
 	});
 
 	it("stops retrying after maxRetries and reports failure", async () => {
-		const harness = await createHarness({ withConfiguredAuth: false });
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			settings: { compaction: { quality: "standard" } },
+		});
 		harnesses.push(harness);
 		seedCompactableSession(harness);
 		harness.settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 2, baseDelayMs: 0 } });
@@ -167,7 +195,10 @@ describe("#6647 compaction retries transient summarization failures", () => {
 	});
 
 	it("aborts an in-flight retry backoff via abortCompaction", async () => {
-		const harness = await createHarness({ withConfiguredAuth: false });
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			settings: { compaction: { quality: "standard" } },
+		});
 		harnesses.push(harness);
 		seedCompactableSession(harness);
 		harness.settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 5, baseDelayMs: 30_000 } });

@@ -76,7 +76,7 @@ function useSummaryStreamFn(
 }
 
 function seedCompactableSession(harness: Harness): void {
-	harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
+	harness.settingsManager.applyOverrides({ compaction: { keepRecentRounds: 1 } });
 	const now = Date.now();
 	harness.sessionManager.appendMessage({
 		role: "user",
@@ -90,6 +90,20 @@ function seedCompactableSession(harness: Harness): void {
 	});
 	assistant.content = [{ type: "text", text: "assistant response to compact" }];
 	harness.sessionManager.appendMessage(assistant);
+	// Second round: with keepRecentRounds: 1 only the last round is kept, so
+	// the first round is what gets summarized.
+	harness.sessionManager.appendMessage({
+		role: "user",
+		content: [{ type: "text", text: "message to compact 2" }],
+		timestamp: now - 300,
+	});
+	const assistant2 = createAssistant(harness, {
+		stopReason: "stop",
+		totalTokens: 100,
+		timestamp: now - 100,
+	});
+	assistant2.content = [{ type: "text", text: "assistant response to compact 2" }];
+	harness.sessionManager.appendMessage(assistant2);
 	harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 }
 
@@ -114,7 +128,7 @@ describe("AgentSession compaction characterization", () => {
 			cost: { input: 0.1, output: 0.2, cacheRead: 0.3, cacheWrite: 0.4, total: 1 },
 		};
 		const harness = await createHarness({
-			settings: { compaction: { keepRecentTokens: 1 } },
+			settings: { compaction: { keepRecentRounds: 1 } },
 			extensionFactories: [
 				(pi) => {
 					pi.on("session_before_compact", async (event) => ({
@@ -158,7 +172,7 @@ describe("AgentSession compaction characterization", () => {
 
 	it("allows a queued prompt to start when manual compaction ends", async () => {
 		const harness = await createHarness({
-			settings: { compaction: { keepRecentTokens: 1 } },
+			settings: { compaction: { keepRecentRounds: 1 } },
 			extensionFactories: [
 				(pi) => {
 					pi.on("session_before_compact", async (event) => ({
@@ -208,7 +222,10 @@ describe("AgentSession compaction characterization", () => {
 	});
 
 	it("manually compacts with a custom streamFn when registry auth is absent", async () => {
-		const harness = await createHarness({ withConfiguredAuth: false });
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			settings: { compaction: { quality: "standard" } },
+		});
 		harnesses.push(harness);
 		seedCompactableSession(harness);
 		const getStreamCallCount = useSummaryStreamFn(harness, "summary from custom stream");
@@ -220,7 +237,10 @@ describe("AgentSession compaction characterization", () => {
 	});
 
 	it("manually compacts with provider-resolved bearer auth", async () => {
-		const harness = await createHarness({ withConfiguredAuth: false });
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			settings: { compaction: { quality: "standard" } },
+		});
 		harnesses.push(harness);
 		const model = harness.getModel();
 		harness.session.modelRuntime.registerNativeProvider({
@@ -255,7 +275,7 @@ describe("AgentSession compaction characterization", () => {
 	});
 
 	it("uses the standalone compaction request context", async () => {
-		const harness = await createHarness({ settings: { compaction: { keepRecentTokens: 1 } } });
+		const harness = await createHarness({ settings: { compaction: { keepRecentRounds: 1 } } });
 		harnesses.push(harness);
 		seedCompactableSession(harness);
 
@@ -299,7 +319,10 @@ describe("AgentSession compaction characterization", () => {
 	});
 
 	it("auto-compacts with a custom streamFn when registry auth is absent", async () => {
-		const harness = await createHarness({ withConfiguredAuth: false });
+		const harness = await createHarness({
+			withConfiguredAuth: false,
+			settings: { compaction: { quality: "standard" } },
+		});
 		harnesses.push(harness);
 		seedCompactableSession(harness);
 		const getStreamCallCount = useSummaryStreamFn(harness, "auto summary from custom stream");
@@ -361,7 +384,7 @@ describe("AgentSession compaction characterization", () => {
 	it("compacts and resumes after a length stop below the desired output limit", async () => {
 		const harness = await createHarness({
 			models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
-			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
+			settings: { compaction: { keepRecentRounds: 1, reserveTokens: 0 } },
 			extensionFactories: [
 				(pi) => {
 					pi.on("session_before_compact", async (event) => ({
@@ -377,13 +400,17 @@ describe("AgentSession compaction characterization", () => {
 		});
 		harnesses.push(harness);
 		harness.setResponses([
+			fauxAssistantMessage("setup answer"),
 			fauxAssistantMessage("partial response", { stopReason: "length" }),
 			fauxAssistantMessage("completed response"),
 		]);
 
+		// Seed a first round so the overflowing round (kept raw, rounds are
+		// never split) leaves something summarizable for compaction.
+		await harness.session.prompt("setup question");
 		await harness.session.prompt("x".repeat(5000));
 
-		expect(harness.faux.state.callCount).toBe(2);
+		expect(harness.faux.state.callCount).toBe(3);
 		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
 			reason: "overflow",
 			aborted: false,
@@ -408,7 +435,7 @@ describe("AgentSession compaction characterization", () => {
 	it("stops after one compact-and-retry when a second response is also truncated", async () => {
 		const harness = await createHarness({
 			models: [{ id: "faux-1", contextWindow: 1_000_000, maxTokens: 100 }],
-			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
+			settings: { compaction: { keepRecentRounds: 1, reserveTokens: 0 } },
 			extensionFactories: [
 				(pi) => {
 					pi.on("session_before_compact", async (event) => ({
@@ -424,13 +451,17 @@ describe("AgentSession compaction characterization", () => {
 		});
 		harnesses.push(harness);
 		harness.setResponses([
+			fauxAssistantMessage("warmup ok"),
 			() => fauxAssistantMessage("x".repeat(64), { stopReason: "length", timestamp: Date.now() + 10_000 }),
 			() => fauxAssistantMessage("y".repeat(64), { stopReason: "length", timestamp: Date.now() + 10_000 }),
 		]);
 
+		// Warmup round gives the compaction window something to summarize:
+		// keepRecentRounds: 1 keeps only the overflowing round.
+		await harness.session.prompt("warmup");
 		await harness.session.prompt("x".repeat(5000));
 
-		expect(harness.faux.state.callCount).toBe(2);
+		expect(harness.faux.state.callCount).toBe(3);
 		expect(harness.eventsOfType("compaction_start").filter((event) => event.reason === "overflow")).toHaveLength(1);
 		expect(harness.eventsOfType("compaction_end").at(-1)?.errorMessage).toBe(
 			"Truncated response recovery failed after one compact-and-retry attempt.",
@@ -467,7 +498,7 @@ describe("AgentSession compaction characterization", () => {
 
 	it("cancels in-progress manual compaction when abortCompaction is called", async () => {
 		const harness = await createHarness({
-			settings: { compaction: { keepRecentTokens: 1 } },
+			settings: { compaction: { keepRecentRounds: 1 } },
 			extensionFactories: [
 				(pi) => {
 					pi.on("session_before_compact", async (event) => {
@@ -493,7 +524,7 @@ describe("AgentSession compaction characterization", () => {
 	it("resumes after threshold compaction when only agent-level queued messages exist", async () => {
 		vi.useFakeTimers();
 		const harness = await createHarness({
-			settings: { compaction: { keepRecentTokens: 1 } },
+			settings: { compaction: { keepRecentRounds: 1 } },
 			extensionFactories: [
 				(pi) => {
 					pi.on("session_before_compact", async (event) => ({
@@ -553,7 +584,7 @@ describe("AgentSession compaction characterization", () => {
 
 	it("compacts successful overflow responses without retrying", async () => {
 		const harness = await createHarness({
-			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
+			settings: { compaction: { enabled: true, keepRecentRounds: 1, reserveTokens: 0 } },
 			models: [{ id: "faux-1", contextWindow: 1, maxTokens: 100 }],
 			extensionFactories: [
 				(pi) => {
@@ -569,8 +600,10 @@ describe("AgentSession compaction characterization", () => {
 			],
 		});
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("completed answer")]);
+		harness.setResponses([fauxAssistantMessage("setup answer"), fauxAssistantMessage("completed answer")]);
 
+		// Seed a first round so the kept round leaves something summarizable.
+		await expect(harness.session.prompt("setup question")).resolves.toBeUndefined();
 		await expect(harness.session.prompt("hello")).resolves.toBeUndefined();
 
 		const compactionEnd = harness.eventsOfType("compaction_end").at(-1);
@@ -579,7 +612,7 @@ describe("AgentSession compaction characterization", () => {
 			aborted: false,
 			willRetry: false,
 		});
-		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.faux.state.callCount).toBe(2);
 	});
 
 	it("ignores stale pre-compaction assistant usage on pre-prompt checks", async () => {

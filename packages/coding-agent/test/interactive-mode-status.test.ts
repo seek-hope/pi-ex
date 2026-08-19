@@ -167,6 +167,19 @@ describe("InteractiveMode.setToolsExpanded", () => {
 	});
 });
 
+function makeStatusFakeInteractions() {
+	return {
+		select: vi.fn(async () => undefined),
+		confirm: vi.fn(async () => false),
+		input: vi.fn(async () => undefined),
+		editor: vi.fn(async () => undefined),
+		notify: vi.fn(),
+		setStatus: vi.fn(),
+		setWidget: vi.fn(),
+		setTitle: vi.fn(),
+	};
+}
+
 describe("InteractiveMode.createExtensionUIContext setTheme", () => {
 	test("persists theme changes to settings manager", () => {
 		initTheme("dark");
@@ -181,6 +194,7 @@ describe("InteractiveMode.createExtensionUIContext setTheme", () => {
 		const fakeThis: any = {
 			session: { settingsManager },
 			settingsManager,
+			interactionPort: makeStatusFakeInteractions(),
 			themeController: {
 				setThemeInstance: vi.fn(() => ({ success: true })),
 				setThemeName: vi.fn(() => {
@@ -211,6 +225,7 @@ describe("InteractiveMode.createExtensionUIContext setTheme", () => {
 		const fakeThis: any = {
 			session: { settingsManager },
 			settingsManager,
+			interactionPort: makeStatusFakeInteractions(),
 			themeController: {
 				setThemeInstance: vi.fn(() => ({ success: true })),
 				setThemeName: vi.fn(() => ({ success: false, error: "Theme not found" })),
@@ -307,6 +322,7 @@ describe("InteractiveMode.createExtensionUIContext addAutocompleteProvider", () 
 		const fakeThis = {
 			autocompleteProviderWrappers: [] as AutocompleteProviderFactory[],
 			setupAutocompleteProvider: vi.fn(),
+			interactionPort: makeStatusFakeInteractions(),
 		};
 
 		const uiContext = (InteractiveMode as any).prototype.createExtensionUIContext.call(fakeThis);
@@ -405,11 +421,13 @@ describe("InteractiveMode.createBaseAutocompleteProvider", () => {
 		type TestModel = { id: string; provider: string; name: string };
 		type FakeInteractiveMode = {
 			session: {
-				scopedModels: Array<{ model: TestModel }>;
-				modelRuntime: { getAvailableSnapshot: () => TestModel[] };
+				modelRuntime: { getAvailable: () => TestModel[]; getAvailableSnapshot: () => TestModel[] };
 				promptTemplates: [];
 				extensionRunner: { getRegisteredCommands: () => [] };
 				resourceLoader: { getSkills: () => { skills: [] } };
+			};
+			controller: {
+				scopedModels: Array<{ model: TestModel }>;
 			};
 			settingsManager: { getEnableSkillCommands: () => boolean };
 			skillCommands: Map<string, string>;
@@ -428,12 +446,13 @@ describe("InteractiveMode.createBaseAutocompleteProvider", () => {
 		];
 		const fakeThis: FakeInteractiveMode = {
 			session: {
-				scopedModels: [],
-				modelRuntime: { getAvailableSnapshot: () => models },
+				modelRuntime: { getAvailable: () => models, getAvailableSnapshot: () => models },
+
 				promptTemplates: [],
 				extensionRunner: { getRegisteredCommands: () => [] },
 				resourceLoader: { getSkills: () => ({ skills: [] }) },
 			},
+			controller: { scopedModels: [] },
 			settingsManager: { getEnableSkillCommands: () => false },
 			skillCommands: new Map(),
 			sessionManager: { getCwd: () => "/tmp" },
@@ -456,7 +475,9 @@ describe("InteractiveMode.createBaseAutocompleteProvider", () => {
 		type FakeInteractiveMode = {
 			session: {
 				scopedModels: [];
-				modelRuntime: { getAvailableSnapshot: () => [] };
+
+				modelRuntime: { getAvailable: () => []; getAvailableSnapshot: () => [] };
+
 				promptTemplates: [];
 				extensionRunner: { getRegisteredCommands: () => [] };
 				resourceLoader: { getSkills: () => { skills: [] } };
@@ -476,7 +497,9 @@ describe("InteractiveMode.createBaseAutocompleteProvider", () => {
 		const fakeThis: FakeInteractiveMode = {
 			session: {
 				scopedModels: [],
-				modelRuntime: { getAvailableSnapshot: () => [] },
+
+				modelRuntime: { getAvailable: () => [], getAvailableSnapshot: () => [] },
+
 				promptTemplates: [],
 				extensionRunner: { getRegisteredCommands: () => [] },
 				resourceLoader: { getSkills: () => ({ skills: [] }) },
@@ -753,7 +776,7 @@ describe("InteractiveMode.showLoadedResources", () => {
 	test("abbreviates extensions in compact listing", () => {
 		const fakeThis = createShowLoadedResourcesThis({
 			quietStartup: false,
-			extensions: [{ path: "/tmp/extensions/answer.ts" }, { path: "/tmp/extensions/btw.ts" }],
+			extensions: [{ path: "/tmp/extensions/answer.ts" }, { path: "/tmp/extensions/notes.ts" }],
 		});
 
 		(InteractiveMode as any).prototype.showLoadedResources.call(fakeThis, {
@@ -762,7 +785,7 @@ describe("InteractiveMode.showLoadedResources", () => {
 
 		const output = renderAll(fakeThis.loadedResourcesContainer);
 		expect(output).toContain("[Extensions]");
-		expect(output).toContain("answer.ts, btw.ts");
+		expect(output).toContain("answer.ts, notes.ts");
 		expect(output).not.toContain("extensions/answer.ts");
 	});
 

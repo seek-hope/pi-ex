@@ -12,10 +12,12 @@ import {
 	Text,
 	truncateToWidth,
 	visibleWidth,
+	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import { KeybindingsManager } from "../../../core/keybindings.ts";
 import type { SessionInfo, SessionListProgress } from "../../../core/session-manager.ts";
 import { canonicalizePath as _canonicalizePath } from "../../../utils/paths.ts";
+import { pushWrapped } from "../../../utils/wrap-lines.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyHint, keyText } from "./keybinding-hints.ts";
@@ -151,18 +153,16 @@ class SessionSelectorHeader implements Component {
 		const availableLeft = Math.max(0, width - visibleWidth(rightText) - 1);
 		const left = truncateToWidth(leftText, availableLeft, "");
 		const spacing = Math.max(0, width - visibleWidth(left) - visibleWidth(rightText));
+		const header = `${left}${" ".repeat(spacing)}${rightText}`;
 
-		// Build hint lines - changes based on state (all branches truncate to width)
-		let hintLine1: string;
-		let hintLine2: string;
+		// Build hint lines - changes based on state (all branches wrap to width)
+		const hints: string[] = [];
 		if (this.confirmingDeletePath !== null) {
 			const confirmHint = `Delete session? ${keyHint("tui.select.confirm", "confirm")} · ${keyHint("tui.select.cancel", "cancel")}`;
-			hintLine1 = theme.fg("error", truncateToWidth(confirmHint, width, "…"));
-			hintLine2 = "";
+			pushWrapped(hints, theme.fg("error", confirmHint), width, 2);
 		} else if (this.statusMessage) {
 			const color = this.statusMessage.type === "error" ? "error" : "accent";
-			hintLine1 = theme.fg(color, truncateToWidth(this.statusMessage.message, width, "…"));
-			hintLine2 = "";
+			pushWrapped(hints, theme.fg(color, this.statusMessage.message), width, 2);
 		} else {
 			const pathState = this.showPath ? "(on)" : "(off)";
 			const sep = theme.fg("muted", " · ");
@@ -178,11 +178,11 @@ class SessionSelectorHeader implements Component {
 				hint2Parts.push(keyHint("app.session.rename", "rename"));
 			}
 			const hint2 = hint2Parts.join(sep);
-			hintLine1 = truncateToWidth(hint1, width, "…");
-			hintLine2 = truncateToWidth(hint2, width, "…");
+			pushWrapped(hints, hint1, width, 2);
+			pushWrapped(hints, hint2, width, 2);
 		}
 
-		return [`${left}${" ".repeat(spacing)}${rightText}`, hintLine1, hintLine2];
+		return [header, ...hints];
 	}
 }
 
@@ -434,79 +434,48 @@ class SessionList implements Component, Focusable {
 				// "Current folder" scope - hint to try "all"
 				emptyMessage = "  No sessions in current folder. Press Tab to view all.";
 			}
-			lines.push(theme.fg("muted", truncateToWidth(emptyMessage, width, "…")));
+			const emptyLines: string[] = [];
+			pushWrapped(emptyLines, theme.fg("muted", emptyMessage), width);
+			lines.push(...emptyLines);
 			return lines;
 		}
 
-		// Calculate visible range with scrolling
-		const startIndex = Math.max(
-			0,
-			Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), this.filteredSessions.length - this.maxVisible),
-		);
-		const endIndex = Math.min(startIndex + this.maxVisible, this.filteredSessions.length);
+		// Render every session row to its own wrapped line block.
+		const rendered: string[][] = [];
+		for (let i = 0; i < this.filteredSessions.length; i++) {
+			rendered.push(this.renderSessionRow(i, width));
+		}
 
-		// Render visible sessions (one line each with tree structure)
+		// Line-aware window containing the selection: rows may wrap to
+		// multiple lines, so paginate by total line count, not row count.
+		const heights = rendered.map((row) => Math.max(1, row.length));
+		let startIndex = 0;
+		let endIndex = rendered.length;
+		if (heights.reduce((a, b) => a + b, 0) > this.maxVisible) {
+			let used = 0;
+			for (let i = 0; i < rendered.length; i++) {
+				const h = heights[i]!;
+				if (used + h > this.maxVisible) {
+					if (i > this.selectedIndex) break;
+					// Drop rows from the top until this row fits (or it is the only row).
+					while (startIndex < i && used + h > this.maxVisible) {
+						used -= heights[startIndex]!;
+						startIndex++;
+					}
+				}
+				used += h;
+				endIndex = i + 1;
+			}
+			// Safety: the selection must be inside the window.
+			if (this.selectedIndex >= endIndex) {
+				startIndex = this.selectedIndex;
+				endIndex = this.selectedIndex + 1;
+			}
+		}
+
+		// Render visible sessions (tree rows, each possibly wrapped)
 		for (let i = startIndex; i < endIndex; i++) {
-			const node = this.filteredSessions[i]!;
-			const session = node.session;
-			const isSelected = i === this.selectedIndex;
-			const isConfirmingDelete = session.path === this.confirmingDeletePath;
-			const isCurrent = this.isCurrentSessionPath(session.path);
-
-			// Build tree prefix
-			const prefix = this.buildTreePrefix(node);
-
-			// Session display text (name or first message)
-			const hasName = !!session.name;
-			const displayText = session.name ?? session.firstMessage;
-			const normalizedMessage = displayText.replace(/[\x00-\x1f\x7f]/g, " ").trim();
-
-			// Right side: message count and age
-			const age = formatSessionDate(session.modified);
-			const msgCount = String(session.messageCount);
-			let rightPart = `${msgCount} ${age}`;
-			if (this.showCwd && session.cwd) {
-				rightPart = `${shortenPath(session.cwd)} ${rightPart}`;
-			}
-			if (this.showPath) {
-				rightPart = `${shortenPath(session.path)} ${rightPart}`;
-			}
-
-			// Cursor
-			const cursor = isSelected ? theme.fg("accent", "› ") : "  ";
-
-			// Calculate available width for message
-			const prefixWidth = visibleWidth(prefix);
-			const rightWidth = visibleWidth(rightPart) + 2; // +2 for spacing
-			const availableForMsg = width - 2 - prefixWidth - rightWidth; // -2 for cursor
-
-			const truncatedMsg = truncateToWidth(normalizedMessage, Math.max(10, availableForMsg), "…");
-
-			// Style message
-			let messageColor: "error" | "warning" | "accent" | null = null;
-			if (isConfirmingDelete) {
-				messageColor = "error";
-			} else if (isCurrent) {
-				messageColor = "accent";
-			} else if (hasName) {
-				messageColor = "warning";
-			}
-			let styledMsg = messageColor ? theme.fg(messageColor, truncatedMsg) : truncatedMsg;
-			if (isSelected) {
-				styledMsg = theme.bold(styledMsg);
-			}
-
-			// Build line
-			const leftPart = cursor + theme.fg("dim", prefix) + styledMsg;
-			const leftWidth = visibleWidth(leftPart);
-			const spacing = Math.max(1, width - leftWidth - visibleWidth(rightPart));
-			const styledRight = theme.fg(isConfirmingDelete ? "error" : "dim", rightPart);
-
-			let line = leftPart + " ".repeat(spacing) + styledRight;
-			if (isSelected) {
-				line = theme.bg("selectedBg", line);
-			}
-			lines.push(truncateToWidth(line, width));
+			lines.push(...rendered[i]!);
 		}
 
 		// Add scroll indicator if needed
@@ -516,6 +485,85 @@ class SessionList implements Component, Focusable {
 			lines.push(scrollInfo);
 		}
 
+		return lines;
+	}
+
+	/**
+	 * Render one session row. The display text wraps instead of truncating;
+	 * continuation lines align under the message start. The first line keeps
+	 * the right-aligned metadata (message count, age, path).
+	 */
+	private renderSessionRow(i: number, width: number): string[] {
+		const lines: string[] = [];
+		const node = this.filteredSessions[i]!;
+		const session = node.session;
+		const isSelected = i === this.selectedIndex;
+		const isConfirmingDelete = session.path === this.confirmingDeletePath;
+		const isCurrent = this.isCurrentSessionPath(session.path);
+
+		// Build tree prefix
+		const prefix = this.buildTreePrefix(node);
+
+		// Session display text (name or first message)
+		const hasName = !!session.name;
+		const displayText = session.name ?? session.firstMessage;
+		const normalizedMessage = displayText.replace(/[\x00-\x1f\x7f]/g, " ").trim();
+
+		// Right side: message count and age
+		const age = formatSessionDate(session.modified);
+		const msgCount = String(session.messageCount);
+		let rightPart = `${msgCount} ${age}`;
+		if (this.showCwd && session.cwd) {
+			rightPart = `${shortenPath(session.cwd)} ${rightPart}`;
+		}
+		if (this.showPath) {
+			rightPart = `${shortenPath(session.path)} ${rightPart}`;
+		}
+
+		// Cursor
+		const cursor = isSelected ? theme.fg("accent", "› ") : "  ";
+
+		// Width available for the message itself (cursor + prefix + right side)
+		const prefixWidth = visibleWidth(prefix);
+		const rightWidth = visibleWidth(rightPart) + 2; // +2 for spacing
+		const availableForMsg = Math.max(10, width - 2 - prefixWidth - rightWidth); // -2 for cursor
+		const continuationIndent = 2 + prefixWidth;
+
+		// Style message
+		let messageColor: "error" | "warning" | "accent" | null = null;
+		if (isConfirmingDelete) {
+			messageColor = "error";
+		} else if (isCurrent) {
+			messageColor = "accent";
+		} else if (hasName) {
+			messageColor = "warning";
+		}
+		const styleMsg = (t: string): string => {
+			let styled = messageColor ? theme.fg(messageColor, t) : t;
+			if (isSelected) styled = theme.bold(styled);
+			return styled;
+		};
+
+		// Wrap the message instead of truncating it
+		const msgLines = wrapTextWithAnsi(normalizedMessage, availableForMsg);
+		for (let k = 0; k < msgLines.length; k++) {
+			const styledMsg = styleMsg(msgLines[k]!);
+			if (k === 0) {
+				// Build line
+				const leftPart = cursor + theme.fg("dim", prefix) + styledMsg;
+				const leftWidth = visibleWidth(leftPart);
+				const spacing = Math.max(1, width - leftWidth - visibleWidth(rightPart));
+				const styledRight = theme.fg(isConfirmingDelete ? "error" : "dim", rightPart);
+
+				let line = leftPart + " ".repeat(spacing) + styledRight;
+				if (isSelected) {
+					line = theme.bg("selectedBg", line);
+				}
+				lines.push(truncateToWidth(line, width));
+			} else {
+				lines.push(" ".repeat(continuationIndent) + styledMsg);
+			}
+		}
 		return lines;
 	}
 

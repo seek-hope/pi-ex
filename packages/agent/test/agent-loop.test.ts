@@ -8,7 +8,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
-import { agentLoop, agentLoopContinue } from "../src/agent-loop.ts";
+import { agentLoop, agentLoopContinue, runAgentLoop } from "../src/agent-loop.ts";
 import { setDefaultStreamFn } from "../src/index.ts";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.ts";
 
@@ -1479,6 +1479,127 @@ describe("agentLoop with AgentMessage", () => {
 		}
 
 		expect(llmCalls).toBe(1);
+	});
+
+	it("removes the partial assistant message from context when the stream fails mid-flight", async () => {
+		// Stream that pushes a `start` event and then explodes on the next event,
+		// simulating a provider connection drop mid-stream.
+		class ExplodingStream extends MockAssistantStream {
+			override async *[Symbol.asyncIterator]() {
+				let count = 0;
+				for await (const event of super[
+					Symbol.asyncIterator
+				]() as unknown as AsyncIterable<AssistantMessageEvent>) {
+					count++;
+					if (count === 1) {
+						// Feed a second event so the next iteration resumes and explodes.
+						queueMicrotask(() => {
+							this.push({
+								type: "text_delta",
+								contentIndex: 0,
+								delta: "more",
+								partial: createAssistantMessage([{ type: "text", text: "more" }]),
+							});
+						});
+					}
+					if (count > 1) {
+						throw new Error("stream exploded");
+					}
+					yield event;
+				}
+			}
+		}
+
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [createUserMessage("hi")],
+			tools: [],
+		};
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+
+		const streamFn = () => {
+			const stream = new ExplodingStream();
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: createAssistantMessage([{ type: "text", text: "partial" }]) });
+			});
+			return stream;
+		};
+
+		await expect(
+			runAgentLoop([createUserMessage("go")], context, config, async () => {}, undefined, streamFn),
+		).rejects.toThrow("stream exploded");
+
+		// The half-written assistant message must have been removed again.
+		expect(context.messages.filter((message) => message.role === "assistant")).toEqual([]);
+		expect(context.messages.every((message) => message.role === "user")).toBe(true);
+		expect(context.messages.length).toBeGreaterThan(0);
+	});
+
+	it("does not start queued parallel tools after an abort", async () => {
+		const toolSchema = Type.Object({ value: Type.String() });
+		const executed: string[] = [];
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				return {
+					content: [{ type: "text", text: `echoed: ${params.value}` }],
+					details: { value: params.value },
+				};
+			},
+		};
+
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [tool],
+		};
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			toolExecution: "parallel",
+		};
+
+		const abortController = new AbortController();
+		let callIndex = 0;
+		const stream = agentLoop([createUserMessage("echo both")], context, config, abortController.signal, () => {
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (callIndex === 0) {
+					const message = createAssistantMessage(
+						[
+							{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "first" } },
+							{ type: "toolCall", id: "tool-2", name: "echo", arguments: { value: "second" } },
+						],
+						"toolUse",
+					);
+					mockStream.push({ type: "done", reason: "toolUse", message });
+					abortController.abort();
+				} else {
+					const message = createAssistantMessage([{ type: "text", text: "done" }]);
+					mockStream.push({ type: "done", reason: "stop", message });
+				}
+				callIndex++;
+			});
+			return mockStream;
+		});
+
+		const events: AgentEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		// At most one tool may have started before the abort landed; the other must
+		// not execute after it.
+		expect(executed.length).toBeLessThanOrEqual(1);
+		const toolEnds = events.filter((e) => e.type === "tool_execution_end");
+		const messages = await stream.result();
+		const toolResults = messages.filter((message) => message.role === "toolResult");
+		expect(toolResults.length).toBeLessThanOrEqual(1);
+		expect(toolEnds.length).toBe(toolResults.length);
 	});
 });
 

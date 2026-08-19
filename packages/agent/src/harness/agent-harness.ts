@@ -11,7 +11,6 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai";
 import type { AgentMessage, AgentTool, QueueMode, ThinkingLevel } from "../types.ts";
-import type { CompactionSettings } from "./compaction/compaction.ts";
 import { type Result as ResultValue, TaggedError } from "./result.ts";
 import type {
 	BranchSummaryEntry,
@@ -252,7 +251,6 @@ export interface AgentHarnessOptions {
 	resources?: Resources;
 	streamOptions?: StreamOptions;
 	retry?: RetryPolicy;
-	compaction?: CompactionSettings;
 	steeringMode?: QueueMode;
 	followUpMode?: QueueMode;
 	toolExecution?: "sequential" | "parallel";
@@ -315,7 +313,6 @@ export class AgentHarness implements AgentLane {
 	private resources: Resources;
 	private streamOptions: StreamOptions;
 	private retryPolicy: RetryPolicy;
-	private compactionSettings: CompactionSettings;
 	private steeringMode: QueueMode;
 	private followUpMode: QueueMode;
 	private closed = false;
@@ -335,11 +332,6 @@ export class AgentHarness implements AgentLane {
 		};
 		this.streamOptions = { ...(options.streamOptions ?? {}) };
 		this.retryPolicy = options.retry ?? { enabled: false, maxRetries: 0, baseDelayMs: 1000 };
-		this.compactionSettings = options.compaction ?? {
-			enabled: true,
-			reserveTokens: 16384,
-			keepRecentTokens: 20000,
-		};
 		this.steeringMode = options.steeringMode ?? "one-at-a-time";
 		this.followUpMode = options.followUpMode ?? "one-at-a-time";
 	}
@@ -480,12 +472,6 @@ export class AgentHarness implements AgentLane {
 	}
 	async setRetryPolicy(policy: RetryPolicy): Promise<void> {
 		this.retryPolicy = { ...policy };
-	}
-	async getCompactionSettings(): Promise<CompactionSettings> {
-		return { ...this.compactionSettings };
-	}
-	async setCompactionSettings(settings: CompactionSettings): Promise<void> {
-		this.compactionSettings = { ...settings };
 	}
 	async getSteeringMode(): Promise<QueueMode> {
 		return this.steeringMode;

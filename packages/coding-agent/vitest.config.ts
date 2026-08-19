@@ -23,6 +23,18 @@ export default mergeConfig(
 		resolve: {
 			alias: [
 				{
+					find: /^@earendil-works\/pi-subagent-core$/,
+					replacement: fileURLToPath(new URL("../subagent-core/src/index.ts", import.meta.url)),
+				},
+				{
+					find: /^@earendil-works\/pi-server\/testing$/,
+					replacement: fileURLToPath(new URL("../server/src/testing/index.ts", import.meta.url)),
+				},
+				{
+					find: /^@earendil-works\/pi-server$/,
+					replacement: fileURLToPath(new URL("../server/src/index.ts", import.meta.url)),
+				},
+				{
 					find: /^@earendil-works\/pi-client$/,
 					replacement: fileURLToPath(new URL("../client/src/index.ts", import.meta.url)),
 				},

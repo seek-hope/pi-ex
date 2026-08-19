@@ -14,6 +14,7 @@ const packages = [
 	{ directory: "packages/client", name: "@earendil-works/pi-client" },
 	{ directory: "packages/session-backends/sqlite-node", name: "@earendil-works/pi-session-backend-sqlite-node" },
 	{ directory: "packages/server", name: "@earendil-works/pi-server" },
+	{ directory: "packages/subagent-core", name: "@earendil-works/pi-subagent-core" },
 	{ directory: "packages/coding-agent", name: "@earendil-works/pi-coding-agent" },
 ];
 

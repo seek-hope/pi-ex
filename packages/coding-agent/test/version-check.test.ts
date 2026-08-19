@@ -13,6 +13,11 @@ const originalSkipVersionCheck = process.env.PI_SKIP_VERSION_CHECK;
 
 beforeEach(() => {
 	allowNetwork();
+	// Ensure tests are not affected by an ambient PI_SKIP_VERSION_CHECK=1 in
+	// the developer/CI environment (would otherwise make checkForNewPiVersion
+	// short-circuit before the mocked fetch is exercised). Tests that need the
+	// skip set it explicitly below.
+	delete process.env.PI_SKIP_VERSION_CHECK;
 });
 
 afterEach(() => {

@@ -451,7 +451,7 @@ describe("AgentSession prompt characterization", () => {
 			releaseCompaction = resolve;
 		});
 		const harness = await createHarness({
-			settings: { compaction: { keepRecentTokens: 1 } },
+			settings: { compaction: { keepRecentRounds: 1 } },
 			extensionFactories: [
 				(pi) => {
 					pi.on("session_before_compact", async (event) => {

@@ -11,7 +11,7 @@ type InteractiveModePrototype = {
 
 type ImportCommandContext = {
 	clearStatusIndicator: () => void;
-	runtimeHost: { importFromJsonl: (inputPath: string, cwdOverride?: string) => Promise<{ cancelled: boolean }> };
+	controller: { importFromJsonl: (inputPath: string, cwdOverride?: string) => Promise<{ cancelled: boolean }> };
 	showError: (message: string) => void;
 	showStatus: (message: string) => void;
 	showExtensionConfirm: (title: string, message: string) => Promise<boolean>;
@@ -50,7 +50,7 @@ describe("InteractiveMode /import parsing", () => {
 		);
 	});
 
-	it("passes unquoted path to runtimeHost.importFromJsonl", async () => {
+	it("passes unquoted path to controller.importFromJsonl", async () => {
 		const importFromJsonl = vi.fn(async () => ({ cancelled: false }));
 		const showExtensionConfirm = vi.fn(async () => true);
 		const showStatus = vi.fn();
@@ -58,7 +58,7 @@ describe("InteractiveMode /import parsing", () => {
 
 		const context: ImportCommandContext = {
 			clearStatusIndicator: vi.fn(),
-			runtimeHost: { importFromJsonl },
+			controller: { importFromJsonl },
 			showError,
 			showStatus,
 			showExtensionConfirm,
@@ -82,7 +82,7 @@ describe("InteractiveMode /import parsing", () => {
 		expect(showStatus).toHaveBeenCalledWith("Session imported from: path/to/session.jsonl");
 	});
 
-	it("passes unquoted apostrophe path to runtimeHost.importFromJsonl unchanged", async () => {
+	it("passes unquoted apostrophe path to controller.importFromJsonl unchanged", async () => {
 		const importFromJsonl = vi.fn(async () => ({ cancelled: false }));
 		const showExtensionConfirm = vi.fn(async () => true);
 		const showStatus = vi.fn();
@@ -90,7 +90,7 @@ describe("InteractiveMode /import parsing", () => {
 
 		const context: ImportCommandContext = {
 			clearStatusIndicator: vi.fn(),
-			runtimeHost: { importFromJsonl },
+			controller: { importFromJsonl },
 			showError,
 			showStatus,
 			showExtensionConfirm,
@@ -123,7 +123,7 @@ describe("InteractiveMode /import parsing", () => {
 
 		const context: ImportCommandContext = {
 			clearStatusIndicator: vi.fn(),
-			runtimeHost: { importFromJsonl },
+			controller: { importFromJsonl },
 			showError,
 			showStatus,
 			showExtensionConfirm,

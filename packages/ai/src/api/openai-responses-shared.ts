@@ -401,6 +401,8 @@ export function convertResponsesTools(tools: readonly Tool[], options?: ConvertR
 
 type StreamingToolCall = ToolCall & {
 	partialJson?: string;
+	/** Length of partialJson at the last full re-parse (avoids O(n²) per-delta parses). */
+	lastParsedLength?: number;
 	customInput?: {
 		property: string;
 		jsonBuffer: GrammarToolInputJsonBuffer;
@@ -653,7 +655,13 @@ export async function processResponsesStream<TApi extends Api>(
 			const slot = getSlot(event.output_index, "toolCall");
 			if (!slot || slot.block.partialJson === undefined) continue;
 			slot.block.partialJson += event.delta;
-			slot.block.arguments = parseStreamingJson(slot.block.partialJson);
+			// Re-parsing the full accumulated JSON on every delta is O(n²) for
+			// long arguments; re-parse only every 256 chars of growth. The done
+			// event below always performs the final full parse.
+			if (slot.block.partialJson.length - (slot.block.lastParsedLength ?? 0) >= 256) {
+				slot.block.arguments = parseStreamingJson(slot.block.partialJson);
+				slot.block.lastParsedLength = slot.block.partialJson.length;
+			}
 			pushToolCallDelta(slot, event.delta);
 		} else if (event.type === "response.function_call_arguments.done") {
 			const slot = getSlot(event.output_index, "toolCall");
@@ -661,6 +669,7 @@ export async function processResponsesStream<TApi extends Api>(
 			const previousPartialJson = slot.block.partialJson;
 			slot.block.partialJson = event.arguments;
 			slot.block.arguments = parseStreamingJson(slot.block.partialJson);
+			slot.block.lastParsedLength = slot.block.partialJson.length;
 
 			if (event.arguments.startsWith(previousPartialJson)) {
 				const delta = event.arguments.slice(previousPartialJson.length);

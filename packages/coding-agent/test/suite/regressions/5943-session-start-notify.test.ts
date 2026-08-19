@@ -88,13 +88,15 @@ type RebindContext = {
 
 type ReloadCommandContext = {
 	hideThinkingBlock: boolean;
-	session: {
+	controller: {
 		isStreaming: boolean;
 		isCompacting: boolean;
 		reload: (options?: { beforeSessionStart?: () => void | Promise<void> }) => Promise<void>;
+	};
+	session: {
 		resourceLoader: { getThemes: () => { themes: [] } };
 		extensionRunner: unknown;
-		modelRegistry: { getError: () => string | undefined };
+		modelRuntime: { getError: () => string | undefined };
 	};
 	settingsManager: {
 		getHttpIdleTimeoutMs: () => number;
@@ -142,8 +144,16 @@ const interactiveModePrototype = InteractiveMode.prototype as unknown as Interac
 
 type ReloadCommandContextOverrides = Omit<
 	Partial<ReloadCommandContext>,
-	"session" | "settingsManager" | "keybindings" | "editorContainer" | "ui" | "defaultEditor" | "themeController"
+	| "controller"
+	| "session"
+	| "settingsManager"
+	| "keybindings"
+	| "editorContainer"
+	| "ui"
+	| "defaultEditor"
+	| "themeController"
 > & {
+	controller?: Partial<ReloadCommandContext["controller"]>;
 	session?: Partial<ReloadCommandContext["session"]>;
 	settingsManager?: Partial<ReloadCommandContext["settingsManager"]>;
 	keybindings?: Partial<ReloadCommandContext["keybindings"]>;
@@ -157,15 +167,18 @@ function createReloadCommandContext(overrides: ReloadCommandContextOverrides = {
 	const editor = overrides.editor ?? {};
 	return {
 		hideThinkingBlock: overrides.hideThinkingBlock ?? false,
-		session: {
+		controller: {
 			isStreaming: false,
 			isCompacting: false,
 			reload: async (options) => {
 				await options?.beforeSessionStart?.();
 			},
+			...overrides.controller,
+		},
+		session: {
 			resourceLoader: { getThemes: () => ({ themes: [] }) },
 			extensionRunner: {},
-			modelRegistry: { getError: () => undefined },
+			modelRuntime: { getError: () => undefined },
 			...overrides.session,
 		},
 		settingsManager: {
@@ -454,7 +467,7 @@ describe("regression #5943: session_start transient UI", () => {
 		let context: ReloadCommandContext;
 		context = createReloadCommandContext({
 			settingsManager: { getHideThinkingBlock: () => true },
-			session: {
+			controller: {
 				reload: async (options) => {
 					events.push("reload");
 					await options?.beforeSessionStart?.();
@@ -488,7 +501,7 @@ describe("regression #5943: session_start transient UI", () => {
 
 		const context = createReloadCommandContext({
 			editor,
-			session: {
+			controller: {
 				reload: async (options) => {
 					await options?.beforeSessionStart?.();
 					markReloadWaiting();

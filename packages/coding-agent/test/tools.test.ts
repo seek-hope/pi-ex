@@ -6,23 +6,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { executeBashWithOperations } from "../src/core/bash-executor.ts";
 import { type BashOperations, createBashTool, createLocalBashOperations } from "../src/core/tools/bash.ts";
 import { computeEditsDiff } from "../src/core/tools/edit-diff.ts";
-import {
-	createEditTool,
-	createFindTool,
-	createGrepTool,
-	createLsTool,
-	createReadTool,
-	createWriteTool,
-} from "../src/index.ts";
+import { createEditTool, createReadTool, createWriteTool } from "../src/index.ts";
 import * as shellModule from "../src/utils/shell.ts";
 
 const readTool = createReadTool(process.cwd());
 const writeTool = createWriteTool(process.cwd());
 const editTool = createEditTool(process.cwd());
 const bashTool = createBashTool(process.cwd());
-const grepTool = createGrepTool(process.cwd());
-const findTool = createFindTool(process.cwd());
-const lsTool = createLsTool(process.cwd());
 
 // Helper to extract text from content blocks
 function getTextOutput(result: any): string {
@@ -73,9 +63,13 @@ describe("Coding Agent Tools", () => {
 
 			const result = await readTool.execute("test-call-1", { path: testFile });
 
-			expect(getTextOutput(result)).toBe(content);
+			const output = getTextOutput(result);
+			// The metadata line carries the file's last-modified time; the content
+			// itself follows it unchanged.
+			expect(output).toMatch(/^\[modified \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{4}\]/);
+			expect(output).toContain(content);
 			// No truncation message since file fits within limits
-			expect(getTextOutput(result)).not.toContain("Use offset=");
+			expect(output).not.toContain("Use offset=");
 			expect(result.details).toBeUndefined();
 		});
 
@@ -486,6 +480,10 @@ describe("Coding Agent Tools", () => {
 		});
 
 		it("should respect timeout", async () => {
+			// A self-rescheduling node child instead of a shell sleep: the sleep
+			// would be converted to a background task by the gate, and short
+			// timeouts on real sleeps are flaky on loaded CI runners (upstream
+			// "reduce redundant slow tests").
 			const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("setInterval(() => {}, 1000)")}`;
 			await expect(bashTool.execute("test-call-10", { command, timeout: 0.05 })).rejects.toThrow(/timed out/i);
 		});
@@ -765,127 +763,6 @@ describe("Coding Agent Tools", () => {
 			const fullOutput = readFileSync(fullOutputPath!, "utf-8");
 			expect(fullOutput).toContain("1\n2\n3");
 			expect(fullOutput).toContain("2998\n2999\n3000");
-		});
-	});
-
-	describe("grep tool", () => {
-		it("should include filename when searching a single file", async () => {
-			const testFile = join(testDir, "example.txt");
-			writeFileSync(testFile, "first line\nmatch line\nlast line");
-
-			const result = await grepTool.execute("test-call-11", {
-				pattern: "match",
-				path: testFile,
-			});
-
-			const output = getTextOutput(result);
-			expect(output).toContain("example.txt:2: match line");
-		});
-
-		it("should respect global limit and include context lines", async () => {
-			const testFile = join(testDir, "context.txt");
-			const content = ["before", "match one", "after", "middle", "match two", "after two"].join("\n");
-			writeFileSync(testFile, content);
-
-			const result = await grepTool.execute("test-call-12", {
-				pattern: "match",
-				path: testFile,
-				limit: 1,
-				context: 1,
-			});
-
-			const output = getTextOutput(result);
-			expect(output).toContain("context.txt-1- before");
-			expect(output).toContain("context.txt:2: match one");
-			expect(output).toContain("context.txt-3- after");
-			expect(output).toContain("[1 matches limit reached. Use limit=2 for more, or refine pattern]");
-			// Ensure second match is not present
-			expect(output).not.toContain("match two");
-		});
-
-		it("should treat flag-like patterns as search text", async () => {
-			const marker = join(testDir, "grep-injection-marker");
-			const payload = join(testDir, "payload.sh");
-			const testFile = join(testDir, "target.txt");
-			writeFileSync(payload, `#!/bin/sh\necho executed > ${marker}\ncat "$1"\n`);
-			chmodSync(payload, 0o755);
-			writeFileSync(testFile, "target\n");
-
-			const result = await grepTool.execute("test-call-grep-injection", {
-				pattern: `--pre=${payload}`,
-				path: testDir,
-			});
-
-			expect(getTextOutput(result)).toContain("No matches found");
-			expect(existsSync(marker)).toBe(false);
-		});
-	});
-
-	describe("find tool", () => {
-		it("should include hidden files that are not gitignored", async () => {
-			const hiddenDir = join(testDir, ".secret");
-			mkdirSync(hiddenDir);
-			writeFileSync(join(hiddenDir, "hidden.txt"), "hidden");
-			writeFileSync(join(testDir, "visible.txt"), "visible");
-
-			const result = await findTool.execute("test-call-13", {
-				pattern: "**/*.txt",
-				path: testDir,
-			});
-
-			const outputLines = getTextOutput(result)
-				.split("\n")
-				.map((line) => line.trim())
-				.filter(Boolean);
-
-			expect(outputLines).toContain("visible.txt");
-			expect(outputLines).toContain(".secret/hidden.txt");
-		});
-
-		it("should respect .gitignore", async () => {
-			writeFileSync(join(testDir, ".gitignore"), "ignored.txt\n");
-			writeFileSync(join(testDir, "ignored.txt"), "ignored");
-			writeFileSync(join(testDir, "kept.txt"), "kept");
-
-			const result = await findTool.execute("test-call-14", {
-				pattern: "**/*.txt",
-				path: testDir,
-			});
-
-			const output = getTextOutput(result);
-			expect(output).toContain("kept.txt");
-			expect(output).not.toContain("ignored.txt");
-		});
-
-		it("should surface fd glob parse errors", async () => {
-			await expect(
-				findTool.execute("test-call-15", {
-					pattern: "[",
-					path: testDir,
-				}),
-			).rejects.toThrow(/error parsing glob|fd exited with code 1|fd error/i);
-		});
-
-		it("should treat flag-like patterns as search text", async () => {
-			const result = await findTool.execute("test-call-find-flag-pattern", {
-				pattern: "--help",
-				path: testDir,
-			});
-
-			expect(getTextOutput(result)).toContain("No files found matching pattern");
-		});
-	});
-
-	describe("ls tool", () => {
-		it("should list dotfiles and directories", async () => {
-			writeFileSync(join(testDir, ".hidden-file"), "secret");
-			mkdirSync(join(testDir, ".hidden-dir"));
-
-			const result = await lsTool.execute("test-call-15", { path: testDir });
-			const output = getTextOutput(result);
-
-			expect(output).toContain(".hidden-file");
-			expect(output).toContain(".hidden-dir/");
 		});
 	});
 });

@@ -269,8 +269,12 @@ export function truncateLine(
 	line: string,
 	maxChars: number = GREP_MAX_LINE_LENGTH,
 ): { text: string; wasTruncated: boolean } {
-	if (line.length <= maxChars) {
+	// Count by Unicode code points (not UTF-16 code units) so that truncating a
+	// line with surrogate pairs (emoji, rare scripts) never leaves an isolated
+	// half surrogate in the output.
+	const codePoints = Array.from(line);
+	if (codePoints.length <= maxChars) {
 		return { text: line, wasTruncated: false };
 	}
-	return { text: `${line.slice(0, maxChars)}... [truncated]`, wasTruncated: true };
+	return { text: `${codePoints.slice(0, maxChars).join("")}... [truncated]`, wasTruncated: true };
 }

@@ -25,8 +25,19 @@ export {
 	createAgentSessionFromServices,
 	createAgentSessionServices,
 } from "./agent-session-services.ts";
+export {
+	ApplicationController,
+	type ApplicationRuntimeHost,
+	type NavigateTreeOptions,
+	type NavigateTreeResult,
+	type QueueMode,
+	type SessionModel,
+	type SessionModelInput,
+	type SessionScopedModels,
+	type SessionScopedModelsInput,
+} from "./application-controller.ts";
 export { type BashExecutorOptions, type BashResult, executeBashWithOperations } from "./bash-executor.ts";
-export type { CompactionResult } from "./compaction/index.ts";
+export type { CompactionResult } from "./compaction/fork.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./event-bus.ts";
 export { areExperimentalFeaturesEnabled } from "./experimental.ts";
 // Extensions system
@@ -77,4 +88,11 @@ export {
 	type TurnStartEvent,
 	type WorkingIndicatorOptions,
 } from "./extensions/index.ts";
+export type {
+	InteractionDialogOptions,
+	InteractionPort,
+	NotificationKind,
+	StringWidgetOptions,
+	WidgetPlacement,
+} from "./interaction-port.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";

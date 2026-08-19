@@ -131,7 +131,7 @@ export class PiServer {
 			id: randomUUID(),
 			connection,
 			decoder: new ClientMessageDecoder({ maxFrameLength: this.maxFrameLength }),
-			sessionIds: new Set(),
+			sessionLeases: new Map(),
 			stage: "awaitingHello",
 			disconnected: false,
 			handshakeComplete: false,

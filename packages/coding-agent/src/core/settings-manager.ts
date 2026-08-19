@@ -12,7 +12,19 @@ import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dis
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
-	keepRecentTokens?: number; // default: 20000
+	keepRecentRounds?: number; // default: 2 - keep the most recent N rounds (turns) unsummarized; the cut always lands on a round boundary
+	quality?: "standard" | "structured"; // default: "structured" - checkpoint format; "standard" is the legacy narrative summary
+	thresholdRatio?: number; // default: 0.9 - compact when context usage exceeds this fraction of the context window
+	uncertaintyReview?: {
+		timing?: "incremental" | "at-compaction"; // default: "incremental" - prompt at run boundaries; "at-compaction" only reviews after compaction
+		maxPerPrompt?: number; // default: 5 - max flags shown per review prompt
+		auto?: boolean; // default: true - the model auto-reviews pending flags (newest first) on intent conflict and at compaction; the user popup is skipped
+	};
+	prune?: {
+		enabled?: boolean; // default: true - prune bulky read-only tool outputs from the context view
+		keepRecentToolResults?: number; // default: 5 - never prune the N most recent eligible (over-threshold) outputs
+		minPrunableTokens?: number; // default: 1000 - only prune results at or above this size
+	};
 }
 
 export interface BranchSummarySettings {
@@ -20,8 +32,53 @@ export interface BranchSummarySettings {
 	skipPrompt?: boolean; // default: false - when true, skips "Summarize branch?" prompt and defaults to no summary
 }
 
+export interface TodoSettings {
+	enabled?: boolean; // default: true - todo flow (todo_write tool + widget)
+}
+
+export interface BackgroundTasksSettings {
+	enabled?: boolean; // default: true - tmux background tasks (bg_spawn/bg_status + /fg /kill /attach)
+}
+
+/**
+ * Settings for the bash tool.
+ *
+ * Note: this block is currently read from the config file only; documentation
+ * will be added to docs/ in a later change.
+ */
+export interface BashSettings {
+	/**
+	 * Expose LLM provider secret env vars (e.g. OPENAI_API_KEY) to spawned
+	 * bash child processes. Default: false (secrets filtered so the model
+	 * cannot read them back via `env`/`echo $VAR`). Setting this true restores
+	 * the previous behavior of passing the full environment through.
+	 */
+	exposeProviderSecrets?: boolean;
+}
+
+export interface SshSettings {
+	enabled?: boolean; // default: true - persistent SSH connections (ssh_exec/scp tools + /ssh)
+}
+
+export interface ComputerUseSettings {
+	enabled?: boolean; // default: true - desktop automation (computer_* tools, Hyprland/Wayland only)
+}
+
+export interface SubagentsSettings {
+	enabled?: boolean; // default: true - in-process sub-agents with git worktree isolation
+	maxDepth?: number; // default: 5 - maximum recursive spawn depth
+	maxConcurrent?: number; // default: 5 - maximum simultaneously running sub-agents
+	timeout?: number; // default: 7200 (2h) - per-run timeout in SECONDS
+	gitName?: string; // default: "pi-subagent" - git author name for sub-agent commits
+	gitEmail?: string; // default: "pi-subagent@localhost" - git author email for sub-agent commits
+}
+
+export interface RecallSettings {
+	enabled?: boolean; // default: true - recall/recall_checkpoints archive retrieval tools
+}
+
 export interface ProviderRetrySettings {
-	timeoutMs?: number; // SDK/provider request timeout in milliseconds
+	timeout?: number; // SDK/provider request timeout in SECONDS
 	maxRetries?: number; // SDK/provider retry attempts
 	maxRetryDelayMs?: number; // default: 60000 (max server-requested delay before failing)
 }
@@ -97,7 +154,17 @@ export interface Settings {
 	followUpMode?: "all" | "one-at-a-time";
 	theme?: string;
 	compaction?: CompactionSettings;
+	codeScan?: {
+		enabled?: boolean; // default: true - after edit/write, scan for references that still need syncing
+	};
 	branchSummary?: BranchSummarySettings;
+	todo?: TodoSettings;
+	backgroundTasks?: BackgroundTasksSettings;
+	bash?: BashSettings;
+	ssh?: SshSettings;
+	computerUse?: ComputerUseSettings;
+	subagents?: SubagentsSettings;
+	recall?: RecallSettings;
 	retry?: RetrySettings;
 	hideThinkingBlock?: boolean;
 	showCacheMissNotices?: boolean; // default: false - show prompt-cache miss and compaction cost notices
@@ -769,6 +836,66 @@ export class SettingsManager {
 		return this.settings.compaction?.enabled ?? true;
 	}
 
+	getTodoEnabled(): boolean {
+		return this.settings.todo?.enabled ?? true;
+	}
+
+	/**
+	 * Background tasks are always enabled: the bash gate auto-converts sleep
+	 * and polling commands into background tasks, so the feature cannot be
+	 * turned off.
+	 */
+	getBackgroundTasksEnabled(): boolean {
+		return true;
+	}
+
+	getSshEnabled(): boolean {
+		return this.settings.ssh?.enabled ?? true;
+	}
+
+	/**
+	 * Whether to expose LLM provider secret env vars to spawned bash child
+	 * processes. Default: false (secrets are filtered out for security; the
+	 * model cannot read them back via `env`/`echo $VAR`). Enable to restore
+	 * the previous behavior of passing the full environment through.
+	 */
+	getBashExposeProviderSecrets(): boolean {
+		return this.settings.bash?.exposeProviderSecrets ?? false;
+	}
+
+	getComputerUseEnabled(): boolean {
+		return this.settings.computerUse?.enabled ?? true;
+	}
+
+	getSubagentsEnabled(): boolean {
+		return this.settings.subagents?.enabled ?? true;
+	}
+
+	getSubagentsMaxDepth(): number {
+		return this.settings.subagents?.maxDepth ?? 5;
+	}
+
+	getSubagentsMaxConcurrent(): number {
+		return this.settings.subagents?.maxConcurrent ?? 5;
+	}
+
+	getSubagentsTimeoutMs(): number {
+		const seconds = this.settings.subagents?.timeout;
+		return seconds !== undefined ? Math.round(seconds * 1000) : 7_200_000;
+	}
+
+	getSubagentsGitName(): string {
+		return this.settings.subagents?.gitName ?? "pi-subagent";
+	}
+
+	getSubagentsGitEmail(): string {
+		return this.settings.subagents?.gitEmail ?? "pi-subagent@localhost";
+	}
+
+	getRecallEnabled(): boolean {
+		return this.settings.recall?.enabled ?? true;
+	}
+
 	setCompactionEnabled(enabled: boolean): void {
 		if (!this.globalSettings.compaction) {
 			this.globalSettings.compaction = {};
@@ -782,15 +909,58 @@ export class SettingsManager {
 		return this.settings.compaction?.reserveTokens ?? 16384;
 	}
 
-	getCompactionKeepRecentTokens(): number {
-		return this.settings.compaction?.keepRecentTokens ?? 20000;
+	getCompactionKeepRecentRounds(): number {
+		return this.settings.compaction?.keepRecentRounds ?? 2;
 	}
 
-	getCompactionSettings(): { enabled: boolean; reserveTokens: number; keepRecentTokens: number } {
+	getCompactionQuality(): "standard" | "structured" {
+		return this.settings.compaction?.quality ?? "structured";
+	}
+
+	getUncertaintyReviewTiming(): "incremental" | "at-compaction" {
+		return this.settings.compaction?.uncertaintyReview?.timing ?? "incremental";
+	}
+
+	getUncertaintyReviewMaxPerPrompt(): number {
+		return this.settings.compaction?.uncertaintyReview?.maxPerPrompt ?? 5;
+	}
+
+	/** Auto-review: the model settles pending flags itself; no user popup. */
+	getUncertaintyReviewAuto(): boolean {
+		return this.settings.compaction?.uncertaintyReview?.auto ?? true;
+	}
+
+	getCodeScanEnabled(): boolean {
+		return this.settings.codeScan?.enabled ?? true;
+	}
+
+	getCompactionSettings(): {
+		enabled: boolean;
+		reserveTokens: number;
+		keepRecentRounds: number;
+		thresholdRatio: number;
+	} {
 		return {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(),
-			keepRecentTokens: this.getCompactionKeepRecentTokens(),
+			keepRecentRounds: this.getCompactionKeepRecentRounds(),
+			thresholdRatio: this.getCompactionThresholdRatio(),
+		};
+	}
+
+	getCompactionThresholdRatio(): number {
+		return this.settings.compaction?.thresholdRatio ?? 0.9;
+	}
+
+	getPruneSettings(): {
+		enabled: boolean;
+		keepRecentToolResults: number;
+		minPrunableTokens: number;
+	} {
+		return {
+			enabled: this.settings.compaction?.prune?.enabled ?? true,
+			keepRecentToolResults: this.settings.compaction?.prune?.keepRecentToolResults ?? 5,
+			minPrunableTokens: this.settings.compaction?.prune?.minPrunableTokens ?? 1000,
 		};
 	}
 
@@ -840,8 +1010,9 @@ export class SettingsManager {
 	}
 
 	getProviderRetrySettings(): { timeoutMs?: number; maxRetries?: number; maxRetryDelayMs: number } {
+		const timeoutSeconds = this.settings.retry?.provider?.timeout;
 		return {
-			timeoutMs: this.settings.retry?.provider?.timeoutMs,
+			timeoutMs: timeoutSeconds !== undefined ? Math.round(timeoutSeconds * 1000) : undefined,
 			maxRetries: this.settings.retry?.provider?.maxRetries,
 			maxRetryDelayMs: this.settings.retry?.provider?.maxRetryDelayMs ?? 60000,
 		};

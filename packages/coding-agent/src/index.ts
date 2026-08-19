@@ -1,7 +1,6 @@
 // Core session management
 
 export { type Args, parseArgs } from "./cli/args.ts";
-
 // Config paths
 export {
 	CONFIG_DIR_NAME,
@@ -24,29 +23,31 @@ export {
 	type SessionStats,
 } from "./core/agent-session.ts";
 export { readStoredCredential } from "./core/auth-storage.ts";
+// Compaction (pi-ex fork pipeline)
+export {
+	type CompactionResult,
+	type CutPointResult,
+	compact,
+	DEFAULT_COMPACTION_SETTINGS,
+	estimateTokens,
+	findCutPoint,
+	generateSummary,
+	generateSummaryWithUsage,
+	shouldCompact,
+} from "./core/compaction/fork.ts";
+export { serializeConversation } from "./core/compaction/fork-utils.ts";
 // Compaction
 export {
 	type BranchPreparation,
 	type BranchSummaryResult,
 	type CollectEntriesResult,
-	type CompactionResult,
-	type CutPointResult,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
-	compact,
-	DEFAULT_COMPACTION_SETTINGS,
-	estimateTokens,
 	type FileOperations,
-	findCutPoint,
-	findTurnStartIndex,
 	type GenerateBranchSummaryOptions,
 	generateBranchSummary,
-	generateSummary,
-	generateSummaryWithUsage,
 	getLastAssistantUsage,
 	prepareBranchEntries,
-	serializeConversation,
-	shouldCompact,
 } from "./core/compaction/index.ts";
 export { createEventBus, type EventBus, type EventBusController } from "./core/event-bus.ts";
 // Extension system
@@ -91,17 +92,12 @@ export type {
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
 	ExtensionWidgetOptions,
-	FindToolCallEvent,
-	GrepToolCallEvent,
 	InlineExtension,
 	InputEvent,
 	InputEventResult,
 	InputSource,
 	KeybindingsManager,
 	LoadExtensionsResult,
-	LsToolCallEvent,
-	MarkdownTransformContext,
-	MarkdownTransformer,
 	MessageEndEvent,
 	MessageRenderer,
 	MessageRenderOptions,
@@ -156,9 +152,6 @@ export {
 	ExtensionRunner,
 	isBashToolResult,
 	isEditToolResult,
-	isFindToolResult,
-	isGrepToolResult,
-	isLsToolResult,
 	isReadToolResult,
 	isToolCallEventType,
 	isWriteToolResult,
@@ -167,6 +160,8 @@ export {
 } from "./core/extensions/index.ts";
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
+// pi-ex fork host bridge (streamFn/settingsManager for fork extensions)
+export { type ForkHostHandle, getForkHost, registerForkHost } from "./core/fork-host.ts";
 export { convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export {
@@ -294,19 +289,7 @@ export {
 	type EditToolDetails,
 	type EditToolInput,
 	type EditToolOptions,
-	type FindOperations,
-	type FindToolDetails,
-	type FindToolInput,
-	type FindToolOptions,
 	formatSize,
-	type GrepOperations,
-	type GrepToolDetails,
-	type GrepToolInput,
-	type GrepToolOptions,
-	type LsOperations,
-	type LsToolDetails,
-	type LsToolInput,
-	type LsToolOptions,
 	type ReadOperations,
 	type ReadToolDetails,
 	type ReadToolInput,
@@ -406,3 +389,10 @@ export { convertToPng } from "./utils/image-convert.ts";
 export { formatDimensionNote, type ResizedImage, resizeImage } from "./utils/image-resize.ts";
 // Shell utilities
 export { getShellConfig } from "./utils/shell.ts";
+export {
+	formatTimeout,
+	type TimeoutInput,
+	TimeoutParamSchema,
+	type TimeoutUnit,
+	timeoutToMs,
+} from "./utils/timeout.ts";

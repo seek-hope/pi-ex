@@ -1,0 +1,43 @@
+{
+	"name": "@earendil-works/pi-subagent-core",
+	"version": "0.84.2",
+	"description": "Runtime-agnostic sub-agent core: git worktree isolation, lifecycle state machine, crash-resume metadata, followup re-tasking, and spawn-tree tracking. Shared by pi coding-agent (standalone) and the DeepSeek Harness worktree provider plugin.",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js",
+			"require": "./dist/index.js"
+		}
+	},
+	"files": [
+		"dist",
+		"README.md",
+		"CHANGELOG.md"
+	],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json",
+		"test": "vitest --run",
+		"typecheck": "tsgo -p tsconfig.test.json",
+		"prepublishOnly": "npm run clean && npm run build"
+	},
+	"keywords": [
+		"pi",
+		"subagent",
+		"worktree",
+		"multi-agent"
+	],
+	"author": "Earendil Works",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/earendil-works/pi.git",
+		"directory": "packages/subagent-core"
+	},
+	"engines": {
+		"node": ">=18"
+	}
+}

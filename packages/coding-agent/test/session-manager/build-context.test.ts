@@ -193,6 +193,31 @@ describe("buildSessionContext", () => {
 			expect(ctx.messages.map((message) => message.role)).toEqual(["compactionSummary", "user", "assistant"]);
 		});
 
+		it("afterCompaction mode returns only entries created after the latest compaction", () => {
+			const entries: SessionEntry[] = [
+				msg("1", null, "user", "first"),
+				msg("2", "1", "assistant", "response1"),
+				msg("3", "2", "user", "second"),
+				msg("4", "3", "assistant", "response2"),
+				compaction("5", "4", "Summary", "3"),
+				msg("6", "5", "user", "third"),
+				msg("7", "6", "assistant", "response3"),
+			];
+
+			// Kept pre-compaction messages (3, 4) must not appear; only the
+			// entries after the compaction entry itself are rendered.
+			expect(buildContextEntries(entries, undefined, undefined, { afterCompaction: true }).map((e) => e.id)).toEqual(
+				["6", "7"],
+			);
+		});
+
+		it("afterCompaction mode falls back to the full path without a compaction", () => {
+			const entries: SessionEntry[] = [msg("1", null, "user", "first"), msg("2", "1", "assistant", "b")];
+			expect(buildContextEntries(entries, undefined, undefined, { afterCompaction: true }).map((e) => e.id)).toEqual(
+				["1", "2"],
+			);
+		});
+
 		it("keeps settings from the full path after compaction", () => {
 			const entries: SessionEntry[] = [
 				msg("1", null, "user", "first"),

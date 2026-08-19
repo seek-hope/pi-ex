@@ -301,6 +301,8 @@ export interface TUI extends Component {
 	setShowHardwareCursor(enabled: boolean): void;
 	getClearOnShrink(): boolean;
 	setClearOnShrink(enabled: boolean): void;
+	/** Clear the terminal scrollback and reset render state (used after compaction). */
+	clearScrollback(): void;
 	setFocus(component: Component | null): void;
 	showOverlay(component: Component, options?: OverlayOptions): OverlayHandle;
 	hideOverlay(): void;
@@ -409,6 +411,11 @@ export abstract class TuiBase extends Container implements TUI {
 	 */
 	setClearOnShrink(enabled: boolean): void {
 		this.clearOnShrink = enabled;
+	}
+
+	/** Default: no-op. Alt/main screens override with their own reset logic. */
+	clearScrollback(): void {
+		this.requestRender(true);
 	}
 
 	getFocusedComponent(): Component | null {

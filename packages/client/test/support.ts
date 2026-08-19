@@ -93,13 +93,22 @@ export function sessionSnapshot(id: string, overrides: Partial<SessionSnapshot> 
 		updatedAt: 1,
 		phase: "idle",
 		model: { provider: "faux", id: "model" },
+		scopedModels: [{ provider: "faux", id: "model" }],
 		thinkingLevel: "off",
 		attached: true,
 		locked: true,
 		revision: 1,
+		eventCursor: 0,
+		lease: { exclusiveControllerConnected: true, observerCount: 0, mode: "exclusive" },
 		transcript: [],
 		queuedSteer: [],
 		queuedSteerCount: 0,
+		queuedFollowUp: [],
+		queuedFollowUpCount: 0,
+		steeringMode: "all",
+		followUpMode: "all",
+		surface: {},
+		pendingInteractions: [],
 		...overrides,
 	};
 }
@@ -138,16 +147,21 @@ export async function attachSession(
 	client: PiClient,
 	server: MemoryByteServer,
 	snapshot: SessionSnapshot,
+	mode: "shared" | "exclusive" = "exclusive",
 ): Promise<PiSessionHandle> {
 	const requests = collectRequests(server);
-	const attaching = client.attachSession(snapshot.id);
+	const attaching = client.acquireSession(snapshot.id, { mode });
 	const request = requests.find((candidate) => candidate.request.command === "attach");
 	if (!request) throw new Error("Missing attach request");
+	const leaseModeProjection = mode === "exclusive" ? "exclusive" : "shared";
 	server.send({
 		type: "response",
 		id: request.id,
 		ok: true,
-		result: { command: "attach", session: snapshot },
+		result: {
+			command: "attach",
+			session: { ...snapshot, lease: { ...snapshot.lease, mode: leaseModeProjection } },
+		},
 	});
 	return attaching;
 }

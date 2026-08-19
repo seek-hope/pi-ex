@@ -27,8 +27,8 @@ describe("PiClient", () => {
 			}
 		});
 
-		const first = await client.attachSession("session-1");
-		const second = await client.attachSession("session-2");
+		const first = await client.acquireSession("session-1", { mode: "exclusive" });
+		const second = await client.acquireSession("session-2", { mode: "exclusive" });
 		expect(first.attached).toBe(true);
 		expect(second.attached).toBe(true);
 		await first.detach();

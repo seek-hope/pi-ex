@@ -1,8 +1,40 @@
 import { randomBytes } from "node:crypto";
-import { createWriteStream, type WriteStream } from "node:fs";
+import { createWriteStream, unlinkSync, type WriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, type TruncationResult, truncateTail } from "./truncate.ts";
+
+// Full-output temp files must outlive the command so the user can open them
+// from the "Full output: <path>" hint, but they must not accumulate forever:
+// schedule a delayed delete and sweep any survivors on process exit.
+const TEMP_FILE_RETENTION_MS = 2 * 60 * 60 * 1000;
+const retainedTempFiles = new Set<string>();
+let exitCleanupInstalled = false;
+
+function installExitCleanup(): void {
+	if (exitCleanupInstalled) return;
+	exitCleanupInstalled = true;
+	process.on("exit", () => {
+		for (const file of retainedTempFiles) {
+			try {
+				unlinkSync(file);
+			} catch {
+				/* ok */
+			}
+		}
+	});
+}
+
+function scheduleTempFileDelete(file: string): void {
+	setTimeout(() => {
+		retainedTempFiles.delete(file);
+		try {
+			unlinkSync(file);
+		} catch {
+			/* ok */
+		}
+	}, TEMP_FILE_RETENTION_MS).unref();
+}
 
 export interface OutputAccumulatorOptions {
 	maxLines?: number;
@@ -31,6 +63,12 @@ function byteLength(text: string): number {
  * Appends decode chunks with a streaming UTF-8 decoder, keeps only a decoded
  * tail for display snapshots, and opens a temp file when the full output needs
  * to be preserved.
+ *
+ * Temp files are created with 0600 perms so other local users cannot read
+ * truncated output that may contain secrets. They are cleaned up via the
+ * delayed `scheduleTempFileDelete` timer and swept on process `exit`; note the
+ * sweep only covers graceful `exit` — a hard SIGTERM/KILL relies on the OS to
+ * reclaim the files (acceptable for /tmp, but no worse than before).
  */
 export class OutputAccumulator {
 	private readonly maxLines: number;
@@ -118,29 +156,6 @@ export class OutputAccumulator {
 		};
 	}
 
-	async closeTempFile(): Promise<void> {
-		if (!this.tempFileStream) {
-			return;
-		}
-
-		const stream = this.tempFileStream;
-		this.tempFileStream = undefined;
-
-		await new Promise<void>((resolve, reject) => {
-			const onError = (error: Error) => {
-				stream.off("finish", onFinish);
-				reject(error);
-			};
-			const onFinish = () => {
-				stream.off("error", onError);
-				resolve();
-			};
-			stream.once("error", onError);
-			stream.once("finish", onFinish);
-			stream.end();
-		});
-	}
-
 	getLastLineBytes(): number {
 		return this.currentLineBytes;
 	}
@@ -213,10 +228,42 @@ export class OutputAccumulator {
 			return;
 		}
 		this.tempFilePath = defaultTempFilePath(this.tempFilePrefix);
-		this.tempFileStream = createWriteStream(this.tempFilePath);
+		retainedTempFiles.add(this.tempFilePath);
+		installExitCleanup();
+		// 0600 so other local users cannot read output that may contain secrets.
+		this.tempFileStream = createWriteStream(this.tempFilePath, { mode: 0o600 });
 		for (const chunk of this.rawChunks) {
 			this.tempFileStream.write(chunk);
 		}
 		this.rawChunks = [];
+	}
+
+	async closeTempFile(): Promise<void> {
+		if (!this.tempFileStream) {
+			return;
+		}
+
+		const stream = this.tempFileStream;
+		this.tempFileStream = undefined;
+
+		await new Promise<void>((resolve, reject) => {
+			const onError = (error: Error) => {
+				stream.off("finish", onFinish);
+				reject(error);
+			};
+			const onFinish = () => {
+				stream.off("error", onError);
+				resolve();
+			};
+			stream.once("error", onError);
+			stream.once("finish", onFinish);
+			stream.end();
+		});
+
+		// Keep the file readable for a while (the "Full output" hint points at it)
+		// but do not let truncated-output temp files accumulate indefinitely.
+		if (this.tempFilePath) {
+			scheduleTempFileDelete(this.tempFilePath);
+		}
 	}
 }

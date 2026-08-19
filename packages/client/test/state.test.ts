@@ -23,6 +23,7 @@ describe("PiClient", () => {
 			type: "event",
 			event: {
 				type: "session_progress",
+				eventCursor: 1,
 				sessionId: "session-1",
 				progress: {
 					type: "assistant_delta",
@@ -34,13 +35,15 @@ describe("PiClient", () => {
 			},
 		});
 		expect(progressTypes).toEqual(["session_progress"]);
-		expect(handle.snapshot).toEqual(initial);
+		// A session_progress event advances the stored snapshot's eventCursor even
+		// though the transcript projection itself is unchanged.
+		expect(handle.snapshot).toEqual({ ...initial, eventCursor: 1 });
 
-		const prompting = handle.prompt("hello");
-		expect(handle.snapshot).toEqual(initial);
+		const prompting = handle.prompt([{ type: "text", text: "hello" }]);
+		expect(handle.snapshot).toEqual({ ...initial, eventCursor: 1 });
 		const promptRequest = requests.find((request) => request.request.command === "prompt");
 		if (!promptRequest) throw new Error("Missing prompt request");
-		const updated = sessionSnapshot("session-1", { revision: 2, phase: "turn" });
+		const updated = sessionSnapshot("session-1", { revision: 2, eventCursor: 1, phase: "turn" });
 		server.send({
 			type: "response",
 			id: promptRequest.id,
@@ -55,7 +58,7 @@ describe("PiClient", () => {
 		unsubscribeEvents();
 		server.send({
 			type: "event",
-			event: { type: "session_snapshot", snapshot: sessionSnapshot("session-1", { revision: 3 }) },
+			event: { type: "session_snapshot", snapshot: sessionSnapshot("session-1", { revision: 3, eventCursor: 1 }) },
 		});
 		expect(observed).toEqual([2]);
 	});

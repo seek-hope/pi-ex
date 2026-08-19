@@ -41,12 +41,39 @@ export class RuntimeCredentials implements CredentialStore {
 		fn: (current: Credential | undefined) => Promise<Credential | undefined>,
 		options?: AuthOperationOptions,
 	): Promise<Credential | undefined> {
+		options?.signal?.throwIfAborted();
+		// When a runtime override is set, apply the mutation to it so modify stays
+		// consistent with read() (which prefers the override).
+		if (this.overrides.has(providerId)) {
+			const current: Credential = {
+				type: "api_key",
+				key: this.overrides.get(providerId) as string,
+			};
+			return fn(current).then((next) => {
+				if (next && next.type === "api_key" && next.key) {
+					this.overrides.set(providerId, next.key);
+					return { type: "api_key" as const, key: next.key } satisfies Credential;
+				}
+				// The mutation removed/replaced the api_key credential: drop the
+				// override and, if a non-api_key credential remains, persist it.
+				this.overrides.delete(providerId);
+				if (next) {
+					return this.store.modify(providerId, () => Promise.resolve(next), options);
+				}
+				return next;
+			});
+		}
 		return this.store.modify(providerId, fn, options);
 	}
 
 	async delete(providerId: string, options?: AuthOperationOptions): Promise<void> {
 		options?.signal?.throwIfAborted();
+		// Capture the override fingerprint so a concurrently-set runtime key is not
+		// clobbered by this delete.
+		const override = this.overrides.get(providerId);
 		await this.store.delete(providerId, options);
-		this.overrides.delete(providerId);
+		if (override !== undefined && this.overrides.get(providerId) === override) {
+			this.overrides.delete(providerId);
+		}
 	}
 }

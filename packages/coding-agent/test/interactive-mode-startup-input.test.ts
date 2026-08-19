@@ -7,10 +7,10 @@ type SubmitContext = {
 		addToHistory?: (text: string) => void;
 		setText: (text: string) => void;
 	};
-	session: {
+	controller: {
+		isBashRunning: boolean;
 		isCompacting: boolean;
 		isStreaming: boolean;
-		isBashRunning: boolean;
 		prompt: (text: string, options?: unknown) => Promise<void>;
 	};
 	flushPendingBashComponents: () => void;
@@ -43,10 +43,10 @@ function createSubmitContext(): SubmitContext {
 			addToHistory: vi.fn(),
 			setText: vi.fn(),
 		},
-		session: {
+		controller: {
+			isBashRunning: false,
 			isCompacting: false,
 			isStreaming: false,
-			isBashRunning: false,
 			prompt: vi.fn(async () => {}),
 		},
 		flushPendingBashComponents: vi.fn(),

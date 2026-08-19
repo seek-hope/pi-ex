@@ -10,6 +10,7 @@ import {
 	openSync,
 	readdirSync,
 	readSync,
+	renameSync,
 	statSync,
 	writeFileSync,
 } from "fs";
@@ -419,6 +420,7 @@ export function buildContextEntries(
 	entries: SessionEntry[],
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
+	options?: { afterCompaction?: boolean },
 ): SessionEntry[] {
 	const path = buildSessionPath(entries, leafId, byId);
 	let compaction: CompactionEntry | null = null;
@@ -436,6 +438,13 @@ export function buildContextEntries(
 	const compactionIdx = path.findIndex((entry) => entry.id === compaction.id);
 	if (compactionIdx < 0) {
 		return path;
+	}
+
+	// Rendering mode: only the entries created after the latest compaction —
+	// used right after a compaction to display the fresh summary plus the
+	// new conversation instead of re-showing the pre-compaction messages.
+	if (options?.afterCompaction) {
+		return path.slice(compactionIdx + 1);
 	}
 
 	const contextEntries: SessionEntry[] = [compaction];
@@ -517,6 +526,7 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 
 	const entries: FileEntry[] = [];
 	const fd = openSync(resolvedFilePath, "r");
+	let lineNumber = 0;
 	try {
 		const decoder = new StringDecoder("utf8");
 		const buffer = Buffer.allocUnsafe(SESSION_READ_BUFFER_SIZE);
@@ -530,8 +540,17 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 			let lineStart = 0;
 			let newlineIndex = pending.indexOf("\n", lineStart);
 			while (newlineIndex !== -1) {
-				const entry = parseSessionEntryLine(pending.slice(lineStart, newlineIndex));
-				if (entry) entries.push(entry);
+				lineNumber++;
+				const line = pending.slice(lineStart, newlineIndex);
+				const entry = parseSessionEntryLine(line);
+				if (entry) {
+					entries.push(entry);
+				} else if (line.trim()) {
+					// Skip malformed lines but make them visible (does not change skip behavior).
+					console.warn(
+						`session-manager: skipping malformed line ${lineNumber} in ${filePath}: ${line.trim().slice(0, 120)}`,
+					);
+				}
 				lineStart = newlineIndex + 1;
 				newlineIndex = pending.indexOf("\n", lineStart);
 			}
@@ -539,8 +558,15 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		}
 
 		pending += decoder.end();
-		const finalEntry = parseSessionEntryLine(pending);
-		if (finalEntry) entries.push(finalEntry);
+		lineNumber++;
+		const entry = parseSessionEntryLine(pending);
+		if (entry) {
+			entries.push(entry);
+		} else if (pending.trim()) {
+			console.warn(
+				`session-manager: skipping malformed line ${lineNumber} in ${filePath}: ${pending.trim().slice(0, 120)}`,
+			);
+		}
 	} finally {
 		closeSync(fd);
 	}
@@ -978,13 +1004,28 @@ export class SessionManager {
 
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		const fd = openSync(this.sessionFile, "w");
+		this._writeSessionFile(this.fileEntries);
+	}
+
+	/** Atomically write all entries to the session file (tmp file + rename).
+	 * A crash mid-write leaves the previous file intact instead of a truncated one.
+	 */
+	private _writeSessionFile(entries: readonly FileEntry[]): void {
+		const file = this.sessionFile!;
+		const tmp = `${file}.tmp`;
+		const fd = openSync(tmp, "w");
 		try {
-			for (const entry of this.fileEntries) {
+			for (const entry of entries) {
 				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
 			}
 		} finally {
 			closeSync(fd);
+		}
+		try {
+			renameSync(tmp, file);
+		} catch (err) {
+			// Best effort: leave the tmp file for diagnosis if rename fails.
+			console.error(`[session-manager] atomic rename failed for ${file}:`, err);
 		}
 	}
 
@@ -1027,14 +1068,8 @@ export class SessionManager {
 		}
 
 		if (!this.flushed) {
-			const fd = openSync(this.sessionFile, "wx");
-			try {
-				for (const e of this.fileEntries) {
-					writeFileSync(fd, `${JSON.stringify(e)}\n`);
-				}
-			} finally {
-				closeSync(fd);
-			}
+			// First assistant message: write the full entry list atomically.
+			this._writeSessionFile(this.fileEntries);
 			this.flushed = true;
 		} else {
 			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
@@ -1118,6 +1153,48 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/** Update the summary text of a compaction entry (e.g. after user review). */
+	updateCompactionSummary(entryId: string, newSummary: string): boolean {
+		const entry = this.byId.get(entryId);
+		if (!entry || entry.type !== "compaction") return false;
+		(entry as CompactionEntry).summary = newSummary;
+		// Persist: without the rewrite the updated summary only lives in memory
+		// and dismissed review markers are lost on restart.
+		this._rewriteFile();
+		return true;
+	}
+
+	/**
+	 * Mark a compaction entry as reviewed by the user. Persisted in the
+	 * entry's details so /review is not offered again after a restart.
+	 */
+	markCompactionReviewed(entryId: string): boolean {
+		const entry = this.byId.get(entryId);
+		if (!entry || entry.type !== "compaction") return false;
+		const compaction = entry as CompactionEntry;
+		const details =
+			compaction.details && typeof compaction.details === "object"
+				? { ...(compaction.details as Record<string, unknown>) }
+				: {};
+		details.reviewedAt = new Date().toISOString();
+		compaction.details = details;
+		this._rewriteFile();
+		return true;
+	}
+
+	/**
+	 * Return the latest compaction entry on the active branch, if any.
+	 * Used to restore a pending /review after a session restart.
+	 */
+	getLatestCompactionEntry(): CompactionEntry | undefined {
+		const branch = this.getBranch();
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const entry = branch[i];
+			if (entry.type === "compaction") return entry as CompactionEntry;
+		}
+		return undefined;
+	}
+
 	/** Append a custom entry (for extensions) as child of current leaf, then advance leaf. Returns entry id. */
 	appendCustomEntry(customType: string, data?: unknown): string {
 		const entry: CustomEntry = {
@@ -1130,6 +1207,39 @@ export class SessionManager {
 		};
 		this._appendEntry(entry);
 		return entry.id;
+	}
+
+	/**
+	 * Prune older custom entries of a customType, keeping the newest `keep`
+	 * on every branch (the tree is append-only, so entries are relinked
+	 * around the removed ones). Rewrites the session file once at the end.
+	 * Returns the number of entries removed.
+	 */
+	pruneCustomEntries(customType: string, keep = 1): number {
+		const matching = this.fileEntries.filter((e) => e.type === "custom" && e.customType === customType);
+		if (matching.length <= keep) return 0;
+		const toRemove = new Set(matching.slice(0, matching.length - keep).map((e) => e.id));
+		// Relink children of removed entries to the removed entry's parent.
+		const parentOf = new Map<string, string | null>();
+		for (const e of this.fileEntries) {
+			if (e.type !== "session") parentOf.set(e.id, e.parentId);
+		}
+		const resolveParent = (id: string): string | null => {
+			let cur: string | null = id;
+			while (cur !== null && toRemove.has(cur)) cur = parentOf.get(cur) ?? null;
+			return cur;
+		};
+		this.fileEntries = this.fileEntries.filter((e) => !toRemove.has(e.id));
+		this.byId = new Map(
+			this.fileEntries.filter((e): e is SessionEntry => e.type !== "session").map((e) => [e.id, e]),
+		);
+		for (const e of this.fileEntries) {
+			if (e.type !== "session" && e.parentId && toRemove.has(e.parentId)) {
+				e.parentId = resolveParent(e.parentId);
+			}
+		}
+		this._rewriteFile();
+		return toRemove.size;
 	}
 
 	/** Append a session info entry (e.g., display name). Returns entry id. */
@@ -1272,9 +1382,11 @@ export class SessionManager {
 	/**
 	 * Build the active, compaction-aware entry list for context/rendering.
 	 * Uses tree traversal from current leaf.
+	 * Pass `{ afterCompaction: true }` for rendering right after a compaction:
+	 * only the entries created after the latest compaction are returned.
 	 */
-	buildContextEntries(): SessionEntry[] {
-		return buildContextEntries(this.getEntries(), this.leafId, this.byId);
+	buildContextEntries(options?: { afterCompaction?: boolean }): SessionEntry[] {
+		return buildContextEntries(this.getEntries(), this.leafId, this.byId, options);
 	}
 
 	/**

@@ -57,7 +57,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 	});
 
 	it("should resume after threshold compaction when only agent-level queued messages exist", async () => {
-		settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
+		settingsManager.applyOverrides({ compaction: { keepRecentRounds: 1 } });
 		const model = session.model!;
 		const now = Date.now();
 		sessionManager.appendMessage({
@@ -81,6 +81,30 @@ describe("AgentSession auto-compaction queue resume", () => {
 			},
 			stopReason: "stop",
 			timestamp: now - 500,
+		});
+		// Second round: with keepRecentTokens: 1 only the tail is kept,
+		// so the first round is what gets summarized.
+		sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "message to compact 2" }],
+			timestamp: now - 300,
+		});
+		sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "assistant response to compact 2" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 100,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: now - 100,
 		});
 		session.agent.state.messages = sessionManager.buildSessionContext().messages;
 		session.agent.streamFunction = (summaryModel) => {

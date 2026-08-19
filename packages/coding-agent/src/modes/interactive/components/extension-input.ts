@@ -8,9 +8,27 @@ import { CountdownTimer } from "./countdown-timer.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
 import { keyHint } from "./keybinding-hints.ts";
 
+/**
+ * Input that renders bullets instead of the typed value (password entry).
+ * Editing behavior is inherited unchanged; only the display is masked.
+ */
+class MaskedInput extends Input {
+	override render(width: number): string[] {
+		const prompt = "> ";
+		const value = this.getValue();
+		const bullets = "\u2022".repeat([...value].length);
+		const available = Math.max(0, width - prompt.length);
+		const visible = bullets.slice(0, available);
+		const cursor = this.focused ? "\x1b[7m \x1b[27m" : "";
+		return [`${prompt}${visible}${cursor}`];
+	}
+}
+
 export interface ExtensionInputOptions {
 	tui?: TUI;
 	timeout?: number;
+	/** Render bullets instead of the typed value (password entry). */
+	masked?: boolean;
 }
 
 export class ExtensionInputComponent extends Container implements Focusable {
@@ -60,7 +78,7 @@ export class ExtensionInputComponent extends Container implements Focusable {
 			);
 		}
 
-		this.input = new Input();
+		this.input = opts?.masked ? new MaskedInput() : new Input();
 		this.addChild(this.input);
 		this.addChild(new Spacer(1));
 		this.addChild(

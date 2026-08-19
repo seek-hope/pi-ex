@@ -22,6 +22,9 @@ import type {
 	StreamFn,
 } from "./types.ts";
 
+const PARALLEL_TOOL_BATCH_TIMEOUT_MS = 20 * 60 * 1000;
+const MAX_LOOP_TURNS = 50;
+
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
 
 /**
@@ -167,7 +170,18 @@ async function runLoop(
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
+	let turns = 0;
 	while (true) {
+		if (signal?.aborted) {
+			break;
+		}
+		if (turns >= MAX_LOOP_TURNS) {
+			// Guard against an endless steering/follow-up loop (e.g. a callback that
+			// keeps feeding messages) that would consume tokens forever.
+			console.error(`agent-loop: exceeded ${MAX_LOOP_TURNS} turns; stopping run`);
+			throw new Error(`Agent loop exceeded ${MAX_LOOP_TURNS} turns and was stopped to prevent an endless cycle.`);
+		}
+		turns++;
 		let hasMoreToolCalls = true;
 
 		// Inner loop: process tool calls and steering messages
@@ -210,7 +224,7 @@ async function runLoop(
 				// them all instead of executing potentially borked calls.
 				const executedToolBatch =
 					message.stopReason === "length"
-						? await failToolCallsFromTruncatedMessage(toolCalls, emit)
+						? await failToolCallsFromTruncatedMessage(toolCalls, emit, signal)
 						: await executeToolCalls(currentContext, message, config, signal, emit);
 				toolResults.push(...executedToolBatch.messages);
 				hasMoreToolCalls = !executedToolBatch.terminate;
@@ -314,50 +328,60 @@ async function streamAssistantResponse(
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
 
-	for await (const event of response) {
-		switch (event.type) {
-			case "start":
-				partialMessage = event.partial;
-				context.messages.push(partialMessage);
-				addedPartial = true;
-				await emit({ type: "message_start", message: { ...partialMessage } });
-				break;
-
-			case "text_start":
-			case "text_delta":
-			case "text_end":
-			case "thinking_start":
-			case "thinking_delta":
-			case "thinking_end":
-			case "toolcall_start":
-			case "toolcall_delta":
-			case "toolcall_end":
-				if (partialMessage) {
+	try {
+		for await (const event of response) {
+			switch (event.type) {
+				case "start":
 					partialMessage = event.partial;
-					context.messages[context.messages.length - 1] = partialMessage;
-					await emit({
-						type: "message_update",
-						assistantMessageEvent: event,
-						message: { ...partialMessage },
-					});
-				}
-				break;
+					context.messages.push(partialMessage);
+					addedPartial = true;
+					await emit({ type: "message_start", message: { ...partialMessage } });
+					break;
 
-			case "done":
-			case "error": {
-				const finalMessage = await response.result();
-				if (addedPartial) {
-					context.messages[context.messages.length - 1] = finalMessage;
-				} else {
-					context.messages.push(finalMessage);
+				case "text_start":
+				case "text_delta":
+				case "text_end":
+				case "thinking_start":
+				case "thinking_delta":
+				case "thinking_end":
+				case "toolcall_start":
+				case "toolcall_delta":
+				case "toolcall_end":
+					if (partialMessage) {
+						partialMessage = event.partial;
+						context.messages[context.messages.length - 1] = partialMessage;
+						await emit({
+							type: "message_update",
+							assistantMessageEvent: event,
+							message: { ...partialMessage },
+						});
+					}
+					break;
+
+				case "done":
+				case "error": {
+					const finalMessage = await response.result();
+					if (addedPartial) {
+						context.messages[context.messages.length - 1] = finalMessage;
+					} else {
+						context.messages.push(finalMessage);
+					}
+					if (!addedPartial) {
+						await emit({ type: "message_start", message: { ...finalMessage } });
+					}
+					await emit({ type: "message_end", message: finalMessage });
+					return finalMessage;
 				}
-				if (!addedPartial) {
-					await emit({ type: "message_start", message: { ...finalMessage } });
-				}
-				await emit({ type: "message_end", message: finalMessage });
-				return finalMessage;
 			}
 		}
+	} catch (err) {
+		// The stream failed mid-flight after message_start: drop the partial
+		// assistant message we pushed so the context does not keep an orphan
+		// half-written message alongside the failure record.
+		if (addedPartial && context.messages[context.messages.length - 1] === partialMessage) {
+			context.messages.pop();
+		}
+		throw err;
 	}
 
 	const finalMessage = await response.result();
@@ -381,9 +405,15 @@ async function streamAssistantResponse(
 async function failToolCallsFromTruncatedMessage(
 	toolCalls: AgentToolCall[],
 	emit: AgentEventSink,
+	signal?: AbortSignal,
 ): Promise<ExecutedToolCallBatch> {
 	const messages: ToolResultMessage[] = [];
 	for (const toolCall of toolCalls) {
+		if (signal?.aborted) {
+			// Bail out promptly on abort instead of emitting the remaining error
+			// results one by one.
+			break;
+		}
 		await emit({
 			type: "tool_execution_start",
 			toolCallId: toolCall.id,
@@ -494,7 +524,28 @@ async function executeToolCallsParallel(
 	signal: AbortSignal | undefined,
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
-	const finalizedCalls: FinalizedToolCallEntry[] = [];
+	// Batch-scoped abort: aborted either by the caller's signal or by the batch
+	// timeout, so a tool that ignores its signal cannot hang the whole turn
+	// forever (the batch yields timed-out error results instead).
+	const batchController = new AbortController();
+	const batchSignal = batchController.signal;
+	if (signal?.aborted) {
+		batchController.abort();
+	} else {
+		signal?.addEventListener("abort", () => batchController.abort(), { once: true });
+	}
+	const batchTimer = setTimeout(() => {
+		batchController.abort();
+	}, PARALLEL_TOOL_BATCH_TIMEOUT_MS);
+
+	type PreparedEntry = {
+		toolCall: AgentToolCall;
+		started: boolean;
+		emitted: boolean;
+		run: () => Promise<FinalizedToolCallOutcome>;
+	};
+	const preparedEntries: PreparedEntry[] = [];
+	const immediateResults: FinalizedToolCallOutcome[] = [];
 
 	for (const toolCall of toolCalls) {
 		await emit({
@@ -512,44 +563,114 @@ async function executeToolCallsParallel(
 				isError: preparation.isError,
 			} satisfies FinalizedToolCallOutcome;
 			await emitToolExecutionEnd(finalized, emit);
-			finalizedCalls.push(finalized);
+			immediateResults.push(finalized);
 			if (signal?.aborted) {
 				break;
 			}
 			continue;
 		}
 
-		finalizedCalls.push(async () => {
-			const executed = await executePreparedToolCall(preparation, signal, emit);
-			const finalized = await finalizeExecutedToolCall(
-				currentContext,
-				assistantMessage,
-				preparation,
-				executed,
-				config,
-				signal,
-			);
-			await emitToolExecutionEnd(finalized, emit);
-			return finalized;
-		});
+		const entry: PreparedEntry = {
+			toolCall,
+			started: false,
+			emitted: false,
+			run: async () => {
+				const executed = await executePreparedToolCall(preparation, batchSignal, emit);
+				const finalized = await finalizeExecutedToolCall(
+					currentContext,
+					assistantMessage,
+					preparation,
+					executed,
+					config,
+					batchSignal,
+				);
+				if (entry.emitted) return finalized; // superseded by the timeout path
+				entry.emitted = true;
+				await emitToolExecutionEnd(finalized, emit);
+				return finalized;
+			},
+		};
+		preparedEntries.push(entry);
 		if (signal?.aborted) {
 			break;
 		}
 	}
 
-	const orderedFinalizedCalls = await Promise.all(
-		finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry))),
+	// Emit a timed-out/aborted error result exactly once per entry: either here
+	// (for entries that never started) or inside entry.run() (which wins the race
+	// if the tool actually settles first). Started-but-hanging tools keep running
+	// in the background; their late emission is suppressed via entry.emitted.
+	const synthesizeError = async (entry: PreparedEntry): Promise<FinalizedToolCallOutcome> => {
+		if (entry.emitted) {
+			return createErrorToolResult("Tool call superseded by batch timeout") as unknown as FinalizedToolCallOutcome;
+		}
+		entry.emitted = true;
+		const finalized = {
+			toolCall: entry.toolCall,
+			result: createErrorToolResult(
+				`Tool call "${entry.toolCall.name}" was not executed: the parallel batch exceeded ` +
+					`${PARALLEL_TOOL_BATCH_TIMEOUT_MS / 60000} minutes or was aborted before it started.`,
+			),
+			isError: true,
+		} satisfies FinalizedToolCallOutcome;
+		await emitToolExecutionEnd(finalized, emit);
+		return finalized;
+	};
+
+	const orderedPrepared = new Array<FinalizedToolCallOutcome | undefined>(preparedEntries.length);
+	const batchDeadline = Date.now() + PARALLEL_TOOL_BATCH_TIMEOUT_MS;
+	await Promise.all(
+		preparedEntries.map(async (entry, index) => {
+			// Never start queued tools after the deadline passed: synthesize an error.
+			if (!entry.started && Date.now() >= batchDeadline) {
+				orderedPrepared[index] = await synthesizeError(entry);
+				return;
+			}
+			entry.started = true;
+			orderedPrepared[index] = await Promise.race([
+				entry.run().catch((err) => {
+					// A late failure after the race settled would otherwise be an
+					// unhandled rejection; fold it into an error result (emitted once).
+					const finalized = {
+						toolCall: entry.toolCall,
+						result: createErrorToolResult(err instanceof Error ? err.message : String(err)),
+						isError: true,
+					} satisfies FinalizedToolCallOutcome;
+					if (!entry.emitted) {
+						entry.emitted = true;
+						void emitToolExecutionEnd(finalized, emit);
+					}
+					return finalized;
+				}),
+				new Promise<FinalizedToolCallOutcome>((resolve) => {
+					const remaining = batchDeadline - Date.now();
+					if (remaining <= 0) {
+						void synthesizeError(entry).then(resolve);
+						return;
+					}
+					setTimeout(() => {
+						void synthesizeError(entry).then(resolve);
+					}, remaining);
+				}),
+			]);
+		}),
 	);
+
+	const orderedFinalizedCalls = [...immediateResults, ...orderedPrepared];
 	const messages: ToolResultMessage[] = [];
 	for (const finalized of orderedFinalizedCalls) {
+		if (!finalized) continue;
 		const toolResultMessage = createToolResultMessage(finalized);
 		await emitToolResultMessage(toolResultMessage, emit);
 		messages.push(toolResultMessage);
 	}
 
+	clearTimeout(batchTimer);
 	return {
 		messages,
-		terminate: shouldTerminateToolBatch(orderedFinalizedCalls),
+		terminate: shouldTerminateToolBatch(
+			orderedFinalizedCalls.filter((f): f is FinalizedToolCallOutcome => f !== undefined),
+		),
 	};
 }
 
@@ -576,8 +697,6 @@ type FinalizedToolCallOutcome = {
 	result: AgentToolResult<any>;
 	isError: boolean;
 };
-
-type FinalizedToolCallEntry = FinalizedToolCallOutcome | (() => Promise<FinalizedToolCallOutcome>);
 
 function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): boolean {
 	return finalizedCalls.length > 0 && finalizedCalls.every((finalized) => finalized.result.terminate === true);

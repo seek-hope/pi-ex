@@ -18,7 +18,7 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation e2e", () => {
 	beforeEach(async () => {
 		ctx = await createTestSession({
 			systemPrompt: "You are a helpful assistant. Reply with just a few words.",
-			settingsOverrides: { compaction: { keepRecentTokens: 1 } },
+			settingsOverrides: { compaction: { keepRecentRounds: 1 } },
 		});
 	});
 

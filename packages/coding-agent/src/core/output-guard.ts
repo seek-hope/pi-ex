@@ -18,7 +18,10 @@ function getRawStdoutWrite(): StdoutTakeoverState["rawStdoutWrite"] {
 }
 
 async function writeRawStdoutChunk(text: string): Promise<void> {
-	while (true) {
+	// Bound the backpressure retries: a permanently wedged stdout (EAGAIN that
+	// never clears) must not hang the turn forever.
+	const maxAttempts = 50;
+	for (let attempt = 0; attempt < maxAttempts; attempt++) {
 		try {
 			await new Promise<void>((resolve, reject) => {
 				try {
@@ -35,6 +38,9 @@ async function writeRawStdoutChunk(text: string): Promise<void> {
 			const writeError = error instanceof Error ? error : new Error(String(error));
 			const code = (writeError as Error & { code?: unknown }).code;
 			if (code !== "ENOBUFS" && code !== "EAGAIN" && code !== "EWOULDBLOCK") {
+				throw writeError;
+			}
+			if (attempt === maxAttempts - 1) {
 				throw writeError;
 			}
 			await new Promise<void>((resolve) => setTimeout(resolve, RAW_STDOUT_RETRY_DELAY_MS));
@@ -82,14 +88,37 @@ export function isStdoutTakenOver(): boolean {
 	return stdoutTakeoverState !== undefined;
 }
 
+// Once stdout writes start failing (EPIPE, EBADF, ...) further writes are
+// dropped so a service won't crash mid-session and lose unsaved state. We
+// still surface the error on stderr for diagnostics.
+let stdoutFailed = false;
+let stdoutFailureLogged = false;
+
+function markStdoutFailed(error: unknown): void {
+	stdoutFailed = true;
+	if (!stdoutFailureLogged) {
+		stdoutFailureLogged = true;
+		console.error(`[pi] stdout write failed, further stdout output is suppressed:`, error);
+	}
+}
+
 export function writeRawStdout(text: string): void {
 	if (text.length === 0) {
 		return;
 	}
-	rawStdoutWriteTail = rawStdoutWriteTail.then(() => writeRawStdoutChunk(text));
-	void rawStdoutWriteTail.catch(() => {
-		process.exit(1);
-	});
+	if (stdoutFailed) {
+		return;
+	}
+	rawStdoutWriteTail = rawStdoutWriteTail
+		.then(() => writeRawStdoutChunk(text))
+		.catch((error) => {
+			markStdoutFailed(error);
+		});
+}
+
+/** Whether stdout has failed and writes are being dropped. Exposed for tests. */
+export function hasStdoutFailed(): boolean {
+	return stdoutFailed;
 }
 
 export async function waitForRawStdoutBackpressure(): Promise<void> {

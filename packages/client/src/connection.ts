@@ -200,7 +200,14 @@ export class Connection {
 			this.#failAndClose(new ProtocolValidationError("Unexpected handshake message"));
 			return;
 		}
-		this.#options.onMessage(message);
+		// A connected-path onMessage handler (e.g. PiClient request/event
+		// dispatch) throwing must fail-and-close rather than escape the message
+		// dispatch back into the transport's synchronous event loop.
+		try {
+			this.#options.onMessage(message);
+		} catch (error) {
+			this.#failAndClose(toError(error));
+		}
 	}
 
 	#handleClose(): void {

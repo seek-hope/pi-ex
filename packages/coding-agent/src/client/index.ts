@@ -6,10 +6,3 @@ export {
 	type RemoteSessionOptions,
 	type RemoteSessionState,
 } from "./remote-session.ts";
-export {
-	applyTranscriptProgress,
-	applyTranscriptSnapshot,
-	createTranscriptState,
-	selectTranscript,
-	type TranscriptState,
-} from "./transcript.ts";

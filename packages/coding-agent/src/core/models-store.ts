@@ -130,7 +130,7 @@ export class FileModelsStore implements ModelsStore {
 			latest = current;
 			return { result: undefined, next: JSON.stringify(current, null, 2) };
 		}, options);
-		if (latest) this.updateReadState(this.readState, latest);
+		if (latest) this.updateReadState(this.readState, latest, getFileRevision(this.path));
 	}
 
 	async delete(providerId: string, options?: ModelsStoreOperationOptions): Promise<void> {
@@ -141,6 +141,6 @@ export class FileModelsStore implements ModelsStore {
 			latest = current;
 			return { result: undefined, next: JSON.stringify(current, null, 2) };
 		}, options);
-		if (latest) this.updateReadState(this.readState, latest);
+		if (latest) this.updateReadState(this.readState, latest, getFileRevision(this.path));
 	}
 }

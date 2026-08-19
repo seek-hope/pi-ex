@@ -22,7 +22,6 @@ import {
 	createFileOps,
 	extractFileOpsFromMessage,
 	type FileOperations,
-	formatFileOperations,
 	SUMMARIZATION_SYSTEM_PROMPT,
 	serializeConversation,
 } from "./utils.ts";
@@ -366,9 +365,10 @@ export async function generateBranchSummary(
 	// Prepend preamble to provide context about the branch summary
 	summary = BRANCH_SUMMARY_PREAMBLE + summary;
 
-	// Compute file lists and append to summary
+	// fork(pi-ex): file lists are NOT appended to the narrative summary — they
+	// live in the entry details / FileContextTracker (same convention as the
+	// fork compaction pipeline in fork.ts).
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-	summary += formatFileOperations(readFiles, modifiedFiles);
 
 	return {
 		summary: summary || "No summary generated",

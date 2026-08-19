@@ -17,16 +17,27 @@ import type { RegisteredTool } from "./types.ts";
 export function wrapRegisteredTool(registeredTool: RegisteredTool, runner: ExtensionRunner): AgentTool {
 	const tool = wrapToolDefinition(registeredTool.definition, () => runner.createContext());
 	const execute = tool.execute;
+	// Snapshotting active tools is only an optimisation to propagate tools a run
+	// registered mid-execution. On a stale runner getActiveTools() throws; we must
+	// never let that turn a completed tool call into a rejected execute, so these
+	// reads are best-effort and fail soft.
+	const safeActiveTools = (): Set<string> | undefined => {
+		try {
+			return new Set(runner.getActiveTools());
+		} catch {
+			return undefined;
+		}
+	};
 	return {
 		...tool,
 		execute: async (toolCallId, params, signal, onUpdate) => {
-			const activeBefore = runner.getActiveTools();
+			const activeBefore = safeActiveTools();
 			const result = await execute(toolCallId, params, signal, onUpdate);
-			const activeAfter = runner.getActiveTools();
-			if (!activeBefore.every((name) => activeAfter.includes(name))) return result;
+			const activeAfter = safeActiveTools();
+			if (activeBefore === undefined || activeAfter === undefined) return result;
+			if (![...activeBefore].every((name) => activeAfter.has(name))) return result;
 
-			const beforeNames = new Set(activeBefore);
-			const addedToolNames = activeAfter.filter((name) => !beforeNames.has(name));
+			const addedToolNames = [...activeAfter].filter((name) => !activeBefore.has(name));
 			if (addedToolNames.length === 0) return result;
 			return {
 				...result,

@@ -1,4 +1,6 @@
+import { afterEach } from "vitest";
 import { createInMemoryModelRegistry, createModelRegistry, getModelRuntime } from "../model-runtime-test-utils.ts";
+
 /**
  * Local test harness for the new coding-agent test suite.
  */
@@ -98,8 +100,60 @@ function createTempDir(): string {
 	return tempDir;
 }
 
+// Module-level tracking of live harnesses. Test files are expected to tear each
+// harness down in their own afterEach ("harnesses.pop()?.cleanup()"), but a
+// forgotten cleanup leaks a session/temp dir into later tests. As a safety net
+// we also register a single vitest afterEach below that cleans up anything
+// still alive. cleanup() is idempotent, so manual and fallback cleanup coexist
+// without double-freeing.
+const liveHarnesses: Harness[] = [];
+let fallbackRegistered = false;
+
+function registerFallbackCleanup(): void {
+	if (fallbackRegistered) return;
+	fallbackRegistered = true;
+	afterEach(() => {
+		cleanupAllHarnesses();
+	});
+}
+
+/** Best-effort teardown of every harness still alive (e.g. from a previous suite). */
+export function cleanupAllHarnesses(): void {
+	while (liveHarnesses.length > 0) {
+		const harness = liveHarnesses.shift()!;
+		try {
+			harness.cleanup();
+		} catch {
+			// never let a leaked harness mask the test result
+		}
+	}
+}
+
+function createHarnessCleanup(harness: Harness, dispose: () => void): () => void {
+	let cleaned = false;
+	return () => {
+		const index = liveHarnesses.indexOf(harness);
+		if (index !== -1) liveHarnesses.splice(index, 1);
+		if (cleaned) return;
+		cleaned = true;
+		dispose();
+	};
+}
+
 export async function createHarness(options: HarnessOptions = {}): Promise<Harness> {
 	const tempDir = createTempDir();
+	// Ensure git identity for tests that use git (subagent). Environment
+	// variables work even when the test runner isolates git config files
+	// (e.g. test.sh sets GIT_CONFIG_GLOBAL=/dev/null, which makes
+	// `git config --global` a no-op and commits fail with "Author identity
+	// unknown").
+	// ||= (not ??=): an ambient EMPTY-string GIT_AUTHOR_* is kept by ??= but
+	// makes every git commit die with "empty ident". Non-empty ambient values
+	// are kept — they still produce valid commits in the throwaway test repos.
+	process.env.GIT_AUTHOR_NAME ||= "pi-test";
+	process.env.GIT_AUTHOR_EMAIL ||= "pi-test@example.com";
+	process.env.GIT_COMMITTER_NAME ||= "pi-test";
+	process.env.GIT_COMMITTER_EMAIL ||= "pi-test@example.com";
 	const fauxProvider: FauxProviderRegistration = registerFauxProvider({
 		models: options.models,
 	});
@@ -198,7 +252,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		events.push(event);
 	});
 
-	return {
+	const harness: Harness = {
 		session,
 		sessionManager,
 		settingsManager,
@@ -214,12 +268,18 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			return events.filter((event): event is Extract<AgentSessionEvent, { type: T }> => event.type === type);
 		},
 		tempDir,
-		cleanup() {
-			session.dispose();
-			fauxProvider.unregister();
-			if (existsSync(tempDir)) {
-				rmSync(tempDir, { recursive: true });
-			}
+		cleanup: () => {
+			// placeholder, overwritten after harness is fully constructed
 		},
 	};
+	harness.cleanup = createHarnessCleanup(harness, () => {
+		session.dispose();
+		fauxProvider.unregister();
+		if (existsSync(tempDir)) {
+			rmSync(tempDir, { recursive: true });
+		}
+	});
+	liveHarnesses.push(harness);
+	registerFallbackCleanup();
+	return harness;
 }

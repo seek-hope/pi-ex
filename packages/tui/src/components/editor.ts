@@ -241,6 +241,12 @@ const SLASH_COMMAND_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 };
 
 const ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS = 20;
+// Intended: a small debounce for slash-command completion (like attachments) so
+// repeated keystrokes while typing a command name coalesce into one request.
+// NOT enabled: the existing slash-command editor tests assert synchronous
+// picker updates (they only flush microtasks/setImmediate), so any debounce > 0
+// would break them. If a debounce is added later, those tests must await the
+// timer first (see the "debounces @ autocomplete while typing" test pattern).
 const DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS = ["@", "#"];
 
 function escapeCharacterClass(value: string): string {
@@ -2248,6 +2254,9 @@ export class Editor implements Component, Focusable {
 
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
 		const textBeforeCursor = currentLine.slice(0, this.state.cursorCol);
+		// Slash-command completion intentionally shares the (zero) debounce here:
+		// see the comment beside ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS about why a
+		// non-zero debounce is not enabled for the non-attachment path.
 		return this.autocompleteDebouncePattern.test(textBeforeCursor) ? ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS : 0;
 	}
 

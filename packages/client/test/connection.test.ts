@@ -8,6 +8,7 @@ import {
 	type ServerSnapshot,
 } from "@earendil-works/pi-protocol";
 import { describe, expect, test } from "vitest";
+import { Connection } from "../src/connection.ts";
 import { type ByteTransportFactory, PiClient, PiDisconnectedError } from "../src/index.ts";
 import {
 	attachSession,
@@ -286,7 +287,9 @@ describe("PiClient", () => {
 		await client.connect();
 		const handle = await attachSession(client, server, sessionSnapshot("session-1"));
 		const sentBefore = server.sentByClient.length;
-		await expect(handle.prompt("x".repeat(1_000))).rejects.toBeInstanceOf(ProtocolValidationError);
+		await expect(handle.prompt([{ type: "text", text: "x".repeat(1_000) }])).rejects.toBeInstanceOf(
+			ProtocolValidationError,
+		);
 		expect(server.sentByClient).toHaveLength(sentBefore);
 
 		server.sendRaw(new Uint8Array([0, 0, 2, 1]));
@@ -312,6 +315,42 @@ describe("PiClient", () => {
 			message: expect.stringMatching(/truncated/i),
 		});
 		expect(client.connectionState).toBe("disconnected");
+	});
+
+	test("a connected-path onMessage exception fails and closes instead of escaping dispatch", async () => {
+		const server = new MemoryByteServer();
+		const states: string[] = [];
+		const connection = new Connection({
+			transportFactory: (handlers) => server.connect(handlers),
+			onHandshake: (snapshot) => {
+				void snapshot;
+			},
+			onMessage: () => {
+				throw new Error("boom");
+			},
+			onStateChange: ({ state }) => states.push(state),
+		});
+		server.onMessage((message) => {
+			if (message.type === "hello") {
+				server.send({
+					type: "hello",
+					version: PROTOCOL_VERSION,
+					connectionId: "connection-1",
+					snapshot: baseServerSnapshot,
+				});
+			}
+		});
+		await connection.connect();
+		expect(connection.state).toBe("connected");
+
+		// A post-handshake message whose onMessage dispatch throws must fail-and-close.
+		server.send({
+			type: "event",
+			event: { type: "session_removed", sessionId: "session-1" },
+		});
+		expect(connection.state).toBe("disconnected");
+		expect(server.clientCloseCount).toBe(1);
+		expect(states).toContain("disconnected");
 	});
 
 	test("rejects frame limits outside the unsigned 32-bit range", () => {

@@ -21,13 +21,10 @@ describe("Documentation example", () => {
 				const { preparation, branchEntries } = event;
 				// sessionManager, modelRegistry, and model come from ctx
 				const { sessionManager, modelRegistry } = ctx;
-				const { messagesToSummarize, turnPrefixMessages, tokensBefore, firstKeptEntryId, isSplitTurn } =
-					preparation;
+				const { messagesToSummarize, tokensBefore, firstKeptEntryId } = preparation;
 
 				// Verify types
 				expect(Array.isArray(messagesToSummarize)).toBe(true);
-				expect(Array.isArray(turnPrefixMessages)).toBe(true);
-				expect(typeof isSplitTurn).toBe("boolean");
 				expect(typeof tokensBefore).toBe("number");
 				expect(typeof sessionManager.getEntries).toBe("function");
 				expect(typeof modelRegistry.getApiKeyAndHeaders).toBe("function");
@@ -98,7 +95,6 @@ describe("Documentation example", () => {
 					messagesToSummarize: [
 						{ role: "user", content: [{ type: "text", text: "please remember this" }], timestamp: Date.now() },
 					],
-					turnPrefixMessages: [],
 					tokensBefore: 42,
 					firstKeptEntryId: "entry-1",
 				},

@@ -5,6 +5,13 @@ import type {
 	SessionLease,
 	Unsubscribe,
 } from "@earendil-works/pi-client";
+import {
+	applyTranscriptProgress,
+	applyTranscriptSnapshot,
+	createTranscriptState,
+	selectTranscript,
+	type TranscriptState,
+} from "@earendil-works/pi-client";
 import type {
 	ModelMetadata,
 	ModelRef,
@@ -15,13 +22,6 @@ import type {
 	ThinkingLevel,
 	TranscriptItem,
 } from "@earendil-works/pi-protocol";
-import {
-	applyTranscriptProgress,
-	applyTranscriptSnapshot,
-	createTranscriptState,
-	selectTranscript,
-	type TranscriptState,
-} from "./transcript.ts";
 
 export type RemoteSessionOperation = "open" | "create" | "submit" | "abort" | "setModel" | "setThinking" | "reconnect";
 
@@ -181,7 +181,10 @@ export class RemoteSession {
 			throw new Error(`Session cannot accept input during ${this.phase ?? "unknown"} phase`);
 		}
 		await this.#runOperation("submit", () =>
-			(this.phase === "idle" ? handle.prompt(normalized) : handle.steer(normalized)).then(() => undefined),
+			(this.phase === "idle"
+				? handle.prompt([{ type: "text", text: normalized }])
+				: handle.steer([{ type: "text", text: normalized }])
+			).then(() => undefined),
 		);
 	}
 

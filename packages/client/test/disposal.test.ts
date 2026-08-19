@@ -38,7 +38,9 @@ describe("PiClient disposal", () => {
 		expect(client.connected).toBe(false);
 		expect(handle.attached).toBe(false);
 		await expect(pending).rejects.toBeInstanceOf(PiClientDisposedError);
-		await expect(handle.prompt("after disposal")).rejects.toBeInstanceOf(PiClientDisposedError);
+		await expect(handle.prompt([{ type: "text", text: "after disposal" }])).rejects.toBeInstanceOf(
+			PiClientDisposedError,
+		);
 		await firstDisposal;
 	});
 

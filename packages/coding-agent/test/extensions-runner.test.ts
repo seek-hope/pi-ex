@@ -148,6 +148,10 @@ describe("ExtensionRunner", () => {
 						confirm: async () => false,
 						input: async () => undefined,
 						notify: () => {},
+						editor: async () => undefined,
+						setStatus: () => {},
+						setWidget: () => {},
+						setTitle: () => {},
 					},
 				},
 			);

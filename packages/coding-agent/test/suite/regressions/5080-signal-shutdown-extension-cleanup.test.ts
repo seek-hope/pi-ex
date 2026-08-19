@@ -10,7 +10,7 @@ import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode
 // Regression for https://github.com/earendil-works/pi/issues/5080
 //
 // On SIGTERM/SIGHUP the graceful shutdown must emit `session_shutdown`
-// (runtimeHost.dispose) BEFORE touching the terminal. Extension teardown such
+// (`controller.dispose()`) BEFORE touching the terminal. Extension teardown such
 // as removing a socket does not write to the tty, so it must not be skipped if
 // a later terminal-restore write fails on a dead or stalled terminal. The
 // interactive quit path (Ctrl+D, /quit) keeps the opposite order to preserve
@@ -19,7 +19,7 @@ import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode
 type ShutdownThis = {
 	isShuttingDown: boolean;
 	unregisterSignalHandlers: () => void;
-	runtimeHost: { dispose: () => Promise<void> };
+	controller: { dispose: () => Promise<void> };
 	ui: { terminal: { drainInput: (ms: number) => Promise<void> } };
 	themeController: { disableAutoSync: () => void };
 	stop: () => void;
@@ -70,7 +70,7 @@ function createContext(order: string[], sessionManager = createSessionManager())
 	return {
 		isShuttingDown: false,
 		unregisterSignalHandlers: vi.fn(),
-		runtimeHost: {
+		controller: {
 			dispose: vi.fn(async () => {
 				order.push("dispose");
 			}),
@@ -180,6 +180,6 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		await callShutdown(context, { fromSignal: true });
 
 		expect(order).toEqual([]);
-		expect(context.runtimeHost.dispose).not.toHaveBeenCalled();
+		expect(context.controller.dispose).not.toHaveBeenCalled();
 	});
 });

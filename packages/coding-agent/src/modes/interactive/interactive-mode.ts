@@ -44,7 +44,7 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import chalk from "chalk";
-import { spawn, spawnSync } from "child_process";
+import { spawn } from "child_process";
 import {
 	APP_NAME,
 	APP_TITLE,
@@ -53,11 +53,11 @@ import {
 	getAuthPath,
 	getDebugLogPath,
 	getDocsPath,
-	getShareViewerUrl,
 	VERSION,
 } from "../../config.ts";
 import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
+import { ApplicationController } from "../../core/application-controller.ts";
 import {
 	CACHE_TTL_MS,
 	type CacheMiss,
@@ -65,6 +65,8 @@ import {
 	computeCacheWaste,
 	detectCacheMiss,
 } from "../../core/cache-stats.ts";
+import { dismissItems, parseUncertainItems } from "../../core/compaction/review.ts";
+import type { UncertainFlag } from "../../core/compaction/uncertainty.ts";
 import type {
 	AutocompleteProviderFactory,
 	EditorFactory,
@@ -79,7 +81,13 @@ import type {
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.ts";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
+import { shareSessionAsGist } from "../../core/gist.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
+import type { BackgroundTasksIntegration } from "../../core/integrations/bg-tasks/index.ts";
+import type { SshIntegration } from "../../core/integrations/ssh/index.ts";
+import type { SubagentIntegration } from "../../core/integrations/subagent/index.ts";
+import type { TodoIntegration } from "../../core/integrations/todo/index.ts";
+import type { InteractionPort } from "../../core/interaction-port.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
 import { createCompactionSummaryMessage } from "../../core/messages.ts";
 import {
@@ -112,8 +120,10 @@ import { checkForNewPiVersion, type LatestPiRelease } from "../../utils/version-
 import { ArminComponent } from "./components/armin.ts";
 import { AssistantMessageComponent } from "./components/assistant-message.ts";
 import { BashExecutionComponent } from "./components/bash-execution.ts";
+import { BgTasksWidget } from "./components/bg-tasks-widget.ts";
 import { BorderedLoader } from "./components/bordered-loader.ts";
 import { BranchSummaryMessageComponent } from "./components/branch-summary-message.ts";
+import { CompactionReviewWidget } from "./components/compaction-review.ts";
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.ts";
 import { CustomEditor } from "./components/custom-editor.ts";
 import { CustomEntryComponent } from "./components/custom-entry.ts";
@@ -149,6 +159,12 @@ import {
 import { ToolExecutionComponent } from "./components/tool-execution.ts";
 import { TreeSelectorComponent } from "./components/tree-selector.ts";
 import { TrustSelectorComponent } from "./components/trust-selector.ts";
+import {
+	type UncertaintyBrowseResult,
+	UncertaintyBrowseWidget,
+	type UncertaintyReviewResult,
+	UncertaintyReviewWidget,
+} from "./components/uncertainty-review.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.ts";
 import { editInExternalEditor } from "./external-editor.ts";
@@ -414,6 +430,8 @@ export function createInteractiveTuiReference(getTui: () => TUI): TUI {
 
 export class InteractiveMode {
 	private runtimeHost: AgentSessionRuntime;
+	private readonly controller: ApplicationController;
+	private readonly interactionPort: InteractionPort;
 	private renderer: TuiMainScreen | TuiAltScreen;
 	private ui: TUI;
 	private mainScreenRenderState: TuiMainScreenRenderState | undefined;
@@ -504,6 +522,8 @@ export class InteractiveMode {
 
 	// Messages queued while compaction is running
 	private compactionQueuedMessages: CompactionQueuedMessage[] = [];
+	// Pending post-compaction review (compactionEntryId, summary)
+	private pendingCompactionReview?: { entryId: string; summary: string };
 
 	// Shutdown state
 	private shutdownRequested = false;
@@ -558,6 +578,25 @@ export class InteractiveMode {
 
 	constructor(runtimeHost: AgentSessionRuntime, options: InteractiveModeOptions = {}) {
 		this.runtimeHost = runtimeHost;
+		// Build the transport-neutral port once. The callbacks are lazy arrows
+		// that reach into TUI methods on first invocation, so they may reference
+		// UI state initialized later without executing during construction.
+		this.interactionPort = {
+			select: (title, opts, dialogOpts) => this.showExtensionSelector(title, opts, dialogOpts),
+			confirm: (title, message, dialogOpts) => this.showExtensionConfirm(title, message, dialogOpts),
+			input: (title, placeholder, dialogOpts) => this.showExtensionInput(title, placeholder, dialogOpts),
+			editor: (title, prefill) => this.showExtensionEditor(title, prefill),
+			notify: (message, kind) => this.showExtensionNotify(message, kind),
+			setStatus: (key, text) => this.setExtensionStatus(key, text),
+			setWidget: (key, lines, options) =>
+				this.setExtensionWidget(
+					key,
+					lines === undefined ? undefined : typeof lines === "string" ? [lines] : lines,
+					options,
+				),
+			setTitle: (title) => this.ui.terminal.setTitle(title),
+		};
+		this.controller = new ApplicationController(runtimeHost, this.interactionPort);
 		const tuiMode = options.tuiMode ?? this.settingsManager.getTuiMode();
 		this.options = { ...options, tuiMode };
 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
@@ -601,7 +640,7 @@ export class InteractiveMode {
 		this.editorContainer.addChild(this.editor as Component);
 		this.footerDataProvider = new FooterDataProvider(this.sessionManager.getCwd());
 		this.footer = new FooterComponent(this.session, this.footerDataProvider);
-		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
+		this.footer.setAutoCompactEnabled(this.controller.autoCompactionEnabled);
 		this.footerContainer = new Container();
 		this.footerContainer.addChild(this.footer);
 
@@ -679,8 +718,8 @@ export class InteractiveMode {
 		if (modelCommand) {
 			modelCommand.getArgumentCompletions = (prefix: string): AutocompleteItem[] | null => {
 				const models =
-					this.session.scopedModels.length > 0
-						? this.session.scopedModels.map((s) => s.model)
+					this.controller.scopedModels.length > 0
+						? this.controller.scopedModels.map((s) => s.model)
 						: this.session.modelRuntime.getAvailableSnapshot();
 
 				if (models.length === 0) return null;
@@ -861,7 +900,7 @@ export class InteractiveMode {
 		if (
 			restoreProgress &&
 			this.settingsManager.getShowTerminalProgress() &&
-			(this.session.isStreaming || this.session.isCompacting)
+			(this.controller.isStreaming || this.controller.isCompacting)
 		) {
 			terminal.setProgress(true);
 		}
@@ -876,8 +915,11 @@ export class InteractiveMode {
 		// Load changelog (only show new entries, skip for resumed sessions)
 		this.changelogMarkdown = this.getChangelogForDisplay();
 
-		if (this.session.scopedModels.length > 0 && (this.options.verbose || !this.settingsManager.getQuietStartup())) {
-			const modelList = this.session.scopedModels
+		if (
+			this.controller.scopedModels.length > 0 &&
+			(this.options.verbose || !this.settingsManager.getQuietStartup())
+		) {
+			const modelList = this.controller.scopedModels
 				.map((sm) => {
 					const thinkingStr = sm.thinkingLevel ? `:${sm.thinkingLevel}` : "";
 					return `${sm.model.id}${thinkingStr}`;
@@ -1107,10 +1149,13 @@ export class InteractiveMode {
 
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
 
+		// Offer /review for an un-reviewed compaction from a previous run.
+		this.restorePendingCompactionReview(true);
+
 		// Process initial messages
 		if (initialMessage) {
 			try {
-				await this.session.prompt(initialMessage, { images: initialImages });
+				await this.controller.prompt(initialMessage, { images: initialImages });
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
@@ -1120,7 +1165,7 @@ export class InteractiveMode {
 		if (initialMessages) {
 			for (const message of initialMessages) {
 				try {
-					await this.session.prompt(message);
+					await this.controller.prompt(message);
 				} catch (error: unknown) {
 					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 					this.showError(errorMessage);
@@ -1132,7 +1177,7 @@ export class InteractiveMode {
 		while (true) {
 			const userInput = await this.getUserInput();
 			try {
-				await this.session.prompt(userInput);
+				await this.controller.prompt(userInput);
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
@@ -1211,7 +1256,7 @@ export class InteractiveMode {
 	 */
 	private getChangelogForDisplay(): string | undefined {
 		// Skip changelog for resumed/continued sessions (already have messages)
-		if (this.session.state.messages.length > 0) {
+		if (this.controller.state.messages.length > 0) {
 			return undefined;
 		}
 
@@ -1857,25 +1902,25 @@ export class InteractiveMode {
 	 */
 	private async bindCurrentSessionExtensions(): Promise<void> {
 		const uiContext = this.createExtensionUIContext();
-		await this.session.bindExtensions({
+		await this.controller.bindExtensions({
 			uiContext,
 			mode: "tui",
 			abortHandler: () => {
 				this.restoreQueuedMessagesToEditor({ abort: true });
 			},
 			commandContextActions: {
-				waitForIdle: () => this.session.waitForIdle(),
+				waitForIdle: () => this.controller.waitForIdle(),
 				newSession: async (options) => {
 					this.clearStatusIndicator();
 					try {
-						return await this.runtimeHost.newSession(options);
+						return await this.controller.newSession(options);
 					} catch (error: unknown) {
 						return this.handleFatalRuntimeError("Failed to create session", error);
 					}
 				},
 				fork: async (entryId, options) => {
 					try {
-						const result = await this.runtimeHost.fork(entryId, options);
+						const result = await this.controller.fork(entryId, options);
 						if (!result.cancelled) {
 							this.editor.setText(result.selectedText ?? "");
 							this.showStatus("Forked to new session");
@@ -1886,7 +1931,7 @@ export class InteractiveMode {
 					}
 				},
 				navigateTree: async (targetId, options) => {
-					const result = await this.session.navigateTree(targetId, {
+					const result = await this.controller.navigateTree(targetId, {
 						summarize: options?.summarize,
 						customInstructions: options?.customInstructions,
 						replaceInstructions: options?.replaceInstructions,
@@ -1914,7 +1959,7 @@ export class InteractiveMode {
 			},
 			shutdownHandler: () => {
 				this.shutdownRequested = true;
-				if (this.session.isIdle) {
+				if (this.controller.isIdle) {
 					void this.shutdown();
 				}
 			},
@@ -1940,7 +1985,7 @@ export class InteractiveMode {
 		configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs());
 		this.applyFullscreenScrollbarSetting();
 		this.footer.setSession(this.session);
-		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
+		this.footer.setAutoCompactEnabled(this.controller.autoCompactionEnabled);
 		this.footerDataProvider.setCwd(this.sessionManager.getCwd());
 		this.hideThinkingBlock = this.settingsManager.getHideThinkingBlock();
 		this.outputPad = this.settingsManager.getOutputPad();
@@ -2010,7 +2055,7 @@ export class InteractiveMode {
 	 * Get a registered tool definition by name (for custom rendering).
 	 */
 	private getRegisteredToolDefinition(toolName: string) {
-		return this.session.getToolDefinition(toolName);
+		return this.controller.getToolDefinition(toolName);
 	}
 
 	private getMarkdownTransformers(): MarkdownTransformer[] {
@@ -2032,24 +2077,24 @@ export class InteractiveMode {
 			cwd: this.sessionManager.getCwd(),
 			sessionManager: this.sessionManager,
 			modelRegistry: extensionRunner.getModelRegistry(),
-			model: this.session.model,
-			scopedModels: this.session.scopedModels,
-			thinkingLevel: this.session.thinkingLevel,
-			isIdle: () => this.session.isIdle,
+			model: this.controller.model,
+			scopedModels: this.controller.scopedModels,
+			thinkingLevel: this.controller.thinkingLevel,
+			isIdle: () => this.controller.isIdle,
 			isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
 			signal: this.session.agent.signal,
 			abort: () => {
 				this.restoreQueuedMessagesToEditor({ abort: true });
 			},
-			hasPendingMessages: () => this.session.pendingMessageCount > 0,
+			hasPendingMessages: () => this.controller.pendingMessageCount > 0,
 			shutdown: () => {
 				this.shutdownRequested = true;
 			},
-			getContextUsage: () => this.session.getContextUsage(),
+			getContextUsage: () => this.controller.getContextUsage(),
 			compact: (options) => {
 				void (async () => {
 					try {
-						const result = await this.session.compact(options?.customInstructions);
+						const result = await this.controller.compact(options?.customInstructions);
 						options?.onComplete?.(result);
 					} catch (error) {
 						const err = error instanceof Error ? error : new Error(String(error));
@@ -2057,7 +2102,7 @@ export class InteractiveMode {
 					}
 				})();
 			},
-			getSystemPrompt: () => this.session.systemPrompt,
+			getSystemPrompt: () => this.controller.systemPrompt,
 		});
 
 		// Set up the extension shortcut handler on the default editor
@@ -2111,7 +2156,7 @@ export class InteractiveMode {
 			this.ui.requestRender();
 			return;
 		}
-		if (this.session.isStreaming && this.activeStatusIndicator?.kind !== "working") {
+		if (this.controller.isStreaming && this.activeStatusIndicator?.kind !== "working") {
 			this.showStatusIndicator(
 				new WorkingStatusIndicator(
 					this.ui,
@@ -2171,12 +2216,13 @@ export class InteractiveMode {
 
 		if (Array.isArray(content)) {
 			// Wrap string array in a Container with Text components
+			const maxLines = InteractiveMode.maxWidgetLines();
 			const container = new Container();
-			for (const line of content.slice(0, InteractiveMode.MAX_WIDGET_LINES)) {
+			for (const line of content.slice(0, maxLines)) {
 				container.addChild(new Text(line, 1, 0));
 			}
-			if (content.length > InteractiveMode.MAX_WIDGET_LINES) {
-				container.addChild(new Text(theme.fg("muted", "... (widget truncated)"), 1, 0));
+			if (content.length > maxLines) {
+				container.addChild(new Text(theme.fg("muted", `... (${content.length - maxLines} more lines)`), 1, 0));
 			}
 			component = container;
 		} else {
@@ -2234,8 +2280,15 @@ export class InteractiveMode {
 		this.setHiddenThinkingLabel();
 	}
 
-	// Maximum total widget lines to prevent viewport overflow
-	private static readonly MAX_WIDGET_LINES = 10;
+	/**
+	 * Maximum total widget lines, adaptive to terminal height: one third of
+	 * the screen, clamped to [10, 30]. A fixed cap of 10 was needlessly
+	 * truncating informational widgets (/todo, /tasks) on tall terminals.
+	 */
+	private static maxWidgetLines(): number {
+		const rows = process.stdout.rows ?? 24;
+		return Math.min(30, Math.max(10, Math.floor(rows / 3)));
+	}
 
 	/**
 	 * Render all extension widgets to the widget container.
@@ -2368,28 +2421,18 @@ export class InteractiveMode {
 	 * Create the ExtensionUIContext for extensions.
 	 */
 	private createProjectTrustContext(cwd: string): ProjectTrustContext {
-		const ui = this.createExtensionUIContext();
 		return {
 			cwd,
 			mode: "tui",
 			hasUI: true,
-			ui: {
-				select: ui.select,
-				confirm: ui.confirm,
-				input: ui.input,
-				notify: ui.notify,
-			},
+			ui: this.interactionPort,
 		};
 	}
 
 	private createExtensionUIContext(): ExtensionUIContext {
 		return {
-			select: (title, options, opts) => this.showExtensionSelector(title, options, opts),
-			confirm: (title, message, opts) => this.showExtensionConfirm(title, message, opts),
-			input: (title, placeholder, opts) => this.showExtensionInput(title, placeholder, opts),
-			notify: (message, type) => this.showExtensionNotify(message, type),
+			...this.interactionPort,
 			onTerminalInput: (handler) => this.addExtensionTerminalInputListener(handler),
-			setStatus: (key, text) => this.setExtensionStatus(key, text),
 			setWorkingMessage: (message) => {
 				this.workingMessage = message;
 				if (this.activeStatusIndicator?.kind === "working") {
@@ -2402,12 +2445,10 @@ export class InteractiveMode {
 			setWidget: (key, content, options) => this.setExtensionWidget(key, content, options),
 			setFooter: (factory) => this.setExtensionFooter(factory),
 			setHeader: (factory) => this.setExtensionHeader(factory),
-			setTitle: (title) => this.ui.terminal.setTitle(title),
 			custom: (factory, options) => this.showExtensionCustom(factory, options),
 			pasteToEditor: (text) => this.editor.handleInput(`\x1b[200~${text}\x1b[201~`),
 			setEditorText: (text) => this.editor.setText(text),
 			getEditorText: () => this.editor.getExpandedText?.() ?? this.editor.getText(),
-			editor: (title, prefill) => this.showExtensionEditor(title, prefill),
 			addAutocompleteProvider: (factory) => {
 				this.autocompleteProviderWrappers.push(factory);
 				this.setupAutocompleteProvider();
@@ -2545,7 +2586,7 @@ export class InteractiveMode {
 					this.hideExtensionInput();
 					resolve(undefined);
 				},
-				{ tui: this.ui, timeout: opts?.timeout },
+				{ tui: this.ui, timeout: opts?.timeout, masked: opts?.masked },
 			);
 
 			this.disposeActiveSelector();
@@ -2805,10 +2846,12 @@ export class InteractiveMode {
 		// Set up handlers on defaultEditor - they use this.editor for text access
 		// so they work correctly regardless of which editor is active
 		this.defaultEditor.onEscape = () => {
-			if (this.session.isStreaming) {
+			// An open todo detail page closes on Esc (instead of paging /todo to the end).
+			if (this.controller.getIntegration<TodoIntegration>("todo")?.closeDetailWidget()) return;
+			if (this.controller.isStreaming) {
 				this.restoreQueuedMessagesToEditor({ abort: true });
-			} else if (this.session.isBashRunning) {
-				this.session.abortBash();
+			} else if (this.controller.isBashRunning) {
+				this.controller.abortBash();
 			} else if (this.isBashMode) {
 				this.editor.setText("");
 				this.isBashMode = false;
@@ -2845,6 +2888,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.model.select", () => this.showModelSelector());
 		this.defaultEditor.onAction("app.tools.expand", () => this.toggleToolOutputExpansion());
 		this.defaultEditor.onAction("app.thinking.toggle", () => this.toggleThinkingBlockVisibility());
+		this.defaultEditor.onAction("app.bg.tasks.manage", () => this.toggleBgTaskManager());
 		this.defaultEditor.onAction("app.editor.external", () => void this.handleOpenExternalEditor());
 		this.defaultEditor.onAction("app.message.copy", () => void this.handleCopyCommand({ flashConfirmation: true }));
 		this.defaultEditor.onAction("app.message.followUp", () => this.handleFollowUp());
@@ -3017,6 +3061,51 @@ export class InteractiveMode {
 				await this.handleCompactCommand(customInstructions);
 				return;
 			}
+			if (text === "/todo") {
+				this.editor.setText("");
+				this.controller.getIntegration<TodoIntegration>("todo")?.toggleDetailWidget();
+				return;
+			}
+			if (text === "/review") {
+				this.editor.setText("");
+				await this.handleReviewCommand();
+				return;
+			}
+			if (text === "/tasks") {
+				this.editor.setText("");
+				this.toggleBgTaskManager();
+				return;
+			}
+			if (text === "/fg" || text.startsWith("/fg ")) {
+				this.editor.setText("");
+				await this.handleFgCommand(text === "/fg" ? "" : text.slice(4).trim());
+				return;
+			}
+			if (text === "/kill" || text.startsWith("/kill ")) {
+				this.editor.setText("");
+				await this.handleKillCommand(text === "/kill" ? "" : text.slice(6).trim());
+				return;
+			}
+			if (text === "/attach" || text.startsWith("/attach ")) {
+				this.editor.setText("");
+				await this.handleAttachCommand(text === "/attach" ? "" : text.slice(8).trim());
+				return;
+			}
+			if (text === "/ssh" || text.startsWith("/ssh ")) {
+				this.editor.setText("");
+				await this.handleSshCommand(text === "/ssh" ? "" : text.slice(5).trim());
+				return;
+			}
+			if (text === "/subagent") {
+				this.editor.setText("");
+				const subagent = this.controller.getIntegration<SubagentIntegration>("subagent");
+				if (!subagent) {
+					this.showWarning('Sub-agents are disabled. Enable via "subagents": { "enabled": true }.');
+					return;
+				}
+				subagent.showStatusWidget();
+				return;
+			}
 			if (text === "/reload") {
 				this.editor.setText("");
 				await this.handleReloadCommand();
@@ -3053,7 +3142,7 @@ export class InteractiveMode {
 				const isExcluded = text.startsWith("!!");
 				const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
 				if (command) {
-					if (this.session.isBashRunning) {
+					if (this.controller.isBashRunning) {
 						this.showWarning("A bash command is already running. Press Esc to cancel it first.");
 						this.editor.setText(text);
 						return;
@@ -3067,11 +3156,11 @@ export class InteractiveMode {
 			}
 
 			// Queue input during compaction (extension commands execute immediately)
-			if (this.session.isCompacting) {
+			if (this.controller.isCompacting) {
 				if (this.isExtensionCommand(text)) {
 					this.editor.addToHistory?.(text);
 					this.editor.setText("");
-					await this.session.prompt(text);
+					await this.controller.prompt(text);
 				} else {
 					this.queueCompactionMessage(text, "steer");
 				}
@@ -3080,10 +3169,10 @@ export class InteractiveMode {
 
 			// If streaming, use prompt() with steer behavior
 			// This handles extension commands (execute immediately), prompt template expansion, and queueing
-			if (this.session.isStreaming) {
+			if (this.controller.isStreaming) {
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
-				await this.session.prompt(text, { streamingBehavior: "steer" });
+				await this.controller.prompt(text, { streamingBehavior: "steer" });
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 				return;
@@ -3103,7 +3192,7 @@ export class InteractiveMode {
 	}
 
 	private subscribeToAgent(): void {
-		this.unsubscribe = this.session.subscribe(async (event) => {
+		this.unsubscribe = this.controller.subscribe(async (event) => {
 			await this.handleEvent(event);
 		});
 	}
@@ -3127,7 +3216,12 @@ export class InteractiveMode {
 					this.defaultEditor.onEscape = this.retryEscapeHandler;
 					this.retryEscapeHandler = undefined;
 				}
-				if (this.workingVisible) {
+				if (this.controller.isCompacting) {
+					// The pre-compaction todo-refresh turn runs inside
+					// controller.compact() (manual and auto): the compaction
+					// indicator is already visible and must stay up through
+					// the summarization that follows this turn.
+				} else if (this.workingVisible) {
 					this.showStatusIndicator(
 						new WorkingStatusIndicator(
 							this.ui,
@@ -3229,7 +3323,7 @@ export class InteractiveMode {
 					this.streamingMessage = event.message;
 					let errorMessage: string | undefined;
 					if (this.streamingMessage.stopReason === "aborted") {
-						const retryAttempt = this.session.retryAttempt;
+						const retryAttempt = this.controller.retryAttempt;
 						errorMessage =
 							retryAttempt > 0
 								? `Aborted after ${retryAttempt} retry attempt${retryAttempt > 1 ? "s" : ""}`
@@ -3327,6 +3421,12 @@ export class InteractiveMode {
 
 			case "agent_settled":
 				await this.checkShutdownRequested();
+				await this.maybeShowUncertaintyReview();
+				break;
+
+			case "uncertainty_override_request":
+				// The auto-review wants to overturn a user ruling — confirm first.
+				await this.confirmUserRulingOverride(event.proposal);
 				break;
 
 			case "compaction_start": {
@@ -3336,7 +3436,7 @@ export class InteractiveMode {
 				// Keep editor active; submissions are queued during compaction.
 				this.autoCompactionEscapeHandler = this.defaultEditor.onEscape;
 				this.defaultEditor.onEscape = () => {
-					this.session.abortCompaction();
+					this.controller.abortCompaction();
 				};
 				this.showStatusIndicator(new CompactionStatusIndicator(this.ui, event.reason));
 				this.ui.requestRender();
@@ -3359,13 +3459,15 @@ export class InteractiveMode {
 						this.showStatus("Auto-compaction cancelled");
 					}
 				} else if (event.result) {
-					const entries = this.sessionManager.buildContextEntries();
-					if (entries[0]?.type !== "compaction") {
-						throw new Error("Completed compaction is missing from the session context");
-					}
+					// Replace the summarized-away messages with the compaction summary:
+					// drop all previous chat renderings and scrollback, then render only
+					// the summary plus the messages created after the compaction. The
+					// pre-compaction messages stay out of the screen (they are still in
+					// the session context, and scrollback stays unbounded until the
+					// next compaction clears it again).
 					this.chatContainer.clear();
-					// The latest compaction is prepended for model context; append it below at its chronological position.
-					this.renderSessionEntries(entries.slice(1));
+					this.ui.clearScrollback();
+					this.renderSessionEntries(this.sessionManager.buildContextEntries({ afterCompaction: true }));
 					this.addMessageToChat(
 						createCompactionSummaryMessage(
 							event.result.summary,
@@ -3381,6 +3483,16 @@ export class InteractiveMode {
 						});
 					}
 					this.footer.invalidate();
+
+					// Check for uncertain items the user should review.
+					const uncertain = parseUncertainItems(event.result.summary);
+					if (uncertain.length > 0 && event.result.compactionEntryId) {
+						this.pendingCompactionReview = {
+							entryId: event.result.compactionEntryId,
+							summary: event.result.summary,
+						};
+						this.showStatus(`Compaction complete. ${uncertain.length} unverified items — /review to inspect`);
+					}
 				} else if (event.errorMessage) {
 					if (event.reason === "manual") {
 						this.showError(event.errorMessage);
@@ -3398,7 +3510,7 @@ export class InteractiveMode {
 				// Set up escape to abort retry
 				this.retryEscapeHandler = this.defaultEditor.onEscape;
 				this.defaultEditor.onEscape = () => {
-					this.session.abortRetry();
+					this.controller.abortRetry();
 				};
 				this.showStatusIndicator(
 					new RetryStatusIndicator(this.ui, event.attempt, event.maxAttempts, event.delayMs),
@@ -3681,7 +3793,7 @@ export class InteractiveMode {
 						if (message.stopReason === "aborted" || message.stopReason === "error") {
 							let errorMessage: string;
 							if (message.stopReason === "aborted") {
-								const retryAttempt = this.session.retryAttempt;
+								const retryAttempt = this.controller.retryAttempt;
 								errorMessage =
 									retryAttempt > 0
 										? `Aborted after ${retryAttempt} retry attempt${retryAttempt > 1 ? "s" : ""}`
@@ -3884,7 +3996,7 @@ export class InteractiveMode {
 			// terminal. If the terminal is gone, the restore writes below emit EIO,
 			// which the stdout/stderr error handler turns into emergencyTerminalExit;
 			// the render loop is already idle, so this cannot hot-spin (see #4144).
-			await this.runtimeHost.dispose();
+			await this.controller.dispose();
 			this.themeController.disableAutoSync();
 			await this.ui.terminal.drainInput(1000);
 			this.stop();
@@ -3900,7 +4012,7 @@ export class InteractiveMode {
 		await this.ui.terminal.drainInput(1000);
 
 		this.stop();
-		await this.runtimeHost.dispose();
+		await this.controller.dispose();
 
 		const resumeCommand = formatResumeCommand(this.sessionManager);
 		if (resumeCommand) {
@@ -4046,11 +4158,11 @@ export class InteractiveMode {
 		if (!text) return;
 
 		// Queue input during compaction (extension commands execute immediately)
-		if (this.session.isCompacting) {
+		if (this.controller.isCompacting) {
 			if (this.isExtensionCommand(text)) {
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
-				await this.session.prompt(text);
+				await this.controller.prompt(text);
 			} else {
 				this.queueCompactionMessage(text, "followUp");
 			}
@@ -4059,10 +4171,10 @@ export class InteractiveMode {
 
 		// Alt+Enter queues a follow-up message (waits until agent finishes)
 		// This handles extension commands (execute immediately), prompt template expansion, and queueing
-		if (this.session.isStreaming) {
+		if (this.controller.isStreaming) {
 			this.editor.addToHistory?.(text);
 			this.editor.setText("");
-			await this.session.prompt(text, { streamingBehavior: "followUp" });
+			await this.controller.prompt(text, { streamingBehavior: "followUp" });
 			this.updatePendingMessagesDisplay();
 			this.ui.requestRender();
 		}
@@ -4086,14 +4198,14 @@ export class InteractiveMode {
 		if (this.isBashMode) {
 			this.editor.borderColor = theme.getBashModeBorderColor();
 		} else {
-			const level = this.session.thinkingLevel || "off";
+			const level = this.controller.thinkingLevel || "off";
 			this.editor.borderColor = theme.getThinkingBorderColor(level);
 		}
 		this.ui.requestRender();
 	}
 
 	private cycleThinkingLevel(): void {
-		const newLevel = this.session.cycleThinkingLevel();
+		const newLevel = this.controller.cycleThinkingLevel();
 		if (newLevel === undefined) {
 			this.showStatus("Current model does not support thinking");
 		} else {
@@ -4105,9 +4217,10 @@ export class InteractiveMode {
 
 	private async cycleModel(direction: "forward" | "backward"): Promise<void> {
 		try {
-			const result = await this.session.cycleModel(direction);
+			const result = await this.controller.cycleModel(direction);
 			if (result === undefined) {
-				const msg = this.session.scopedModels.length > 0 ? "Only one model in scope" : "Only one model available";
+				const msg =
+					this.controller.scopedModels.length > 0 ? "Only one model in scope" : "Only one model available";
 				this.showStatus(msg);
 			} else {
 				this.footer.invalidate();
@@ -4255,11 +4368,11 @@ export class InteractiveMode {
 	private getAllQueuedMessages(): { steering: string[]; followUp: string[] } {
 		return {
 			steering: [
-				...this.session.getSteeringMessages(),
+				...this.controller.getSteeringMessages(),
 				...this.compactionQueuedMessages.filter((msg) => msg.mode === "steer").map((msg) => msg.text),
 			],
 			followUp: [
-				...this.session.getFollowUpMessages(),
+				...this.controller.getFollowUpMessages(),
 				...this.compactionQueuedMessages.filter((msg) => msg.mode === "followUp").map((msg) => msg.text),
 			],
 		};
@@ -4270,7 +4383,7 @@ export class InteractiveMode {
 	 * Clears both session queue and compaction queue.
 	 */
 	private clearAllQueues(): { steering: string[]; followUp: string[] } {
-		const { steering, followUp } = this.session.clearQueue();
+		const { steering, followUp } = this.controller.clearQueue();
 		const compactionSteering = this.compactionQueuedMessages
 			.filter((msg) => msg.mode === "steer")
 			.map((msg) => msg.text);
@@ -4352,7 +4465,7 @@ export class InteractiveMode {
 		this.updatePendingMessagesDisplay();
 
 		const restoreQueue = (error: unknown) => {
-			this.session.clearQueue();
+			this.controller.clearQueue();
 			this.compactionQueuedMessages = queuedMessages;
 			this.updatePendingMessagesDisplay();
 			this.showError(
@@ -4367,11 +4480,11 @@ export class InteractiveMode {
 				// When retry is pending, queue messages for the retry turn
 				for (const message of queuedMessages) {
 					if (this.isExtensionCommand(message.text)) {
-						await this.session.prompt(message.text);
+						await this.controller.prompt(message.text);
 					} else if (message.mode === "followUp") {
-						await this.session.followUp(message.text);
+						await this.controller.followUp(message.text);
 					} else {
-						await this.session.steer(message.text);
+						await this.controller.steer(message.text);
 					}
 				}
 				this.updatePendingMessagesDisplay();
@@ -4383,7 +4496,7 @@ export class InteractiveMode {
 			if (firstPromptIndex === -1) {
 				// All extension commands - execute them all
 				for (const message of queuedMessages) {
-					await this.session.prompt(message.text);
+					await this.controller.prompt(message.text);
 				}
 				return;
 			}
@@ -4394,11 +4507,11 @@ export class InteractiveMode {
 			const rest = queuedMessages.slice(firstPromptIndex + 1);
 
 			for (const message of preCommands) {
-				await this.session.prompt(message.text);
+				await this.controller.prompt(message.text);
 			}
 
 			// Start a prompt when idle, or queue it into a run still finishing compaction.
-			const promptPromise = this.session
+			const promptPromise = this.controller
 				.prompt(firstPrompt.text, { streamingBehavior: firstPrompt.mode })
 				.catch((error) => {
 					restoreQueue(error);
@@ -4407,11 +4520,11 @@ export class InteractiveMode {
 			// Queue remaining messages
 			for (const message of rest) {
 				if (this.isExtensionCommand(message.text)) {
-					await this.session.prompt(message.text);
+					await this.controller.prompt(message.text);
 				} else if (message.mode === "followUp") {
-					await this.session.followUp(message.text);
+					await this.controller.followUp(message.text);
 				} else {
-					await this.session.steer(message.text);
+					await this.controller.steer(message.text);
 				}
 			}
 			this.updatePendingMessagesDisplay();
@@ -4475,18 +4588,18 @@ export class InteractiveMode {
 			let selector: SettingsSelectorComponent | undefined;
 			selector = new SettingsSelectorComponent(
 				{
-					autoCompact: this.session.autoCompactionEnabled,
+					autoCompact: this.controller.autoCompactionEnabled,
 					showImages: this.settingsManager.getShowImages(),
 					imageWidthCells: this.settingsManager.getImageWidthCells(),
 					autoResizeImages: this.settingsManager.getImageAutoResize(),
 					blockImages: this.settingsManager.getBlockImages(),
 					enableSkillCommands: this.settingsManager.getEnableSkillCommands(),
-					steeringMode: this.session.steeringMode,
-					followUpMode: this.session.followUpMode,
+					steeringMode: this.controller.steeringMode,
+					followUpMode: this.controller.followUpMode,
 					transport: this.settingsManager.getTransport(),
 					httpIdleTimeoutMs: this.settingsManager.getHttpIdleTimeoutMs(),
-					thinkingLevel: this.session.thinkingLevel,
-					availableThinkingLevels: this.session.getAvailableThinkingLevels(),
+					thinkingLevel: this.controller.thinkingLevel,
+					availableThinkingLevels: this.controller.getAvailableThinkingLevels(),
 					currentTheme: this.themeController.getThemeSelection() || "dark",
 					terminalTheme: this.themeController.getTerminalTheme(),
 					availableThemes: getAvailableThemes(),
@@ -4512,7 +4625,7 @@ export class InteractiveMode {
 				},
 				{
 					onAutoCompactChange: (enabled) => {
-						this.session.setAutoCompactionEnabled(enabled);
+						this.controller.setAutoCompactionEnabled(enabled);
 						this.footer.setAutoCompactEnabled(enabled);
 					},
 					onShowImagesChange: (enabled) => {
@@ -4542,10 +4655,10 @@ export class InteractiveMode {
 						this.setupAutocompleteProvider();
 					},
 					onSteeringModeChange: (mode) => {
-						this.session.setSteeringMode(mode);
+						this.controller.setSteeringMode(mode);
 					},
 					onFollowUpModeChange: (mode) => {
-						this.session.setFollowUpMode(mode);
+						this.controller.setFollowUpMode(mode);
 					},
 					onTransportChange: (transport) => {
 						this.settingsManager.setTransport(transport);
@@ -4557,7 +4670,7 @@ export class InteractiveMode {
 						this.showStatus(`HTTP idle timeout: ${formatHttpIdleTimeoutMs(timeoutMs)}`);
 					},
 					onThinkingLevelChange: (level) => {
-						this.session.setThinkingLevel(level);
+						this.controller.setThinkingLevel(level);
 						this.footer.invalidate();
 						this.updateEditorBorderColor();
 					},
@@ -4618,7 +4731,7 @@ export class InteractiveMode {
 					onOutputPadChange: (padding) => {
 						this.settingsManager.setOutputPad(padding);
 						this.outputPad = padding;
-						if (this.streamingComponent || this.session.isStreaming) {
+						if (this.streamingComponent || this.controller.isStreaming) {
 							for (const child of this.chatContainer.children) {
 								if (
 									child instanceof AssistantMessageComponent ||
@@ -4692,7 +4805,7 @@ export class InteractiveMode {
 		const model = await this.findExactModelMatch(searchTerm);
 		if (model) {
 			try {
-				await this.session.setModel(model);
+				await this.controller.setModel(model);
 				this.footer.invalidate();
 				this.updateEditorBorderColor();
 				this.showStatus(`Model: ${model.id}`);
@@ -4709,11 +4822,11 @@ export class InteractiveMode {
 
 	private async findExactModelMatch(searchTerm: string): Promise<Model<any> | undefined> {
 		const cachedModels =
-			this.session.scopedModels.length > 0
-				? this.session.scopedModels.map((scoped) => scoped.model)
+			this.controller.scopedModels.length > 0
+				? this.controller.scopedModels.map((scoped) => scoped.model)
 				: [...this.session.modelRuntime.getAvailableSnapshot()];
 		const cachedMatch = findExactModelReferenceMatch(searchTerm, cachedModels);
-		if (cachedMatch || this.session.scopedModels.length > 0) return cachedMatch;
+		if (cachedMatch || this.controller.scopedModels.length > 0) return cachedMatch;
 
 		this.showStatus("Refreshing model catalogs…");
 		const controller = new AbortController();
@@ -4744,15 +4857,15 @@ export class InteractiveMode {
 	/** Update the footer's available provider count from the current snapshot without refreshing catalogs. */
 	private updateAvailableProviderCount(): void {
 		const models =
-			this.session.scopedModels.length > 0
-				? this.session.scopedModels.map((scoped) => scoped.model)
+			this.controller.scopedModels.length > 0
+				? this.controller.scopedModels.map((scoped) => scoped.model)
 				: this.session.modelRuntime.getAvailableSnapshot();
 		const uniqueProviders = new Set(models.map((model) => model.provider));
 		this.footerDataProvider.setAvailableProviderCount(uniqueProviders.size);
 	}
 
 	private async maybeWarnAboutAnthropicSubscriptionAuth(
-		model: Model<any> | undefined = this.session.model,
+		model: Model<any> | undefined = this.controller.model,
 	): Promise<void> {
 		if (this.settingsManager.getWarnings().anthropicExtraUsage === false) {
 			return;
@@ -4836,13 +4949,13 @@ export class InteractiveMode {
 		this.showSelector((done) => {
 			const selector = new ModelSelectorComponent(
 				this.ui,
-				this.session.model,
+				this.controller.model,
 				this.settingsManager,
 				this.session.modelRuntime,
-				this.session.scopedModels,
+				this.controller.scopedModels,
 				async (model) => {
 					try {
-						await this.session.setModel(model);
+						await this.controller.setModel(model);
 						this.footer.invalidate();
 						this.updateEditorBorderColor();
 						done();
@@ -4868,7 +4981,7 @@ export class InteractiveMode {
 		let availableModels = [...this.session.modelRuntime.getAvailableSnapshot()];
 		let availableModelIds = new Set(availableModels.map((model) => `${model.provider}/${model.id}`));
 		const configuredPatterns = this.settingsManager.getEnabledModels();
-		const sessionScopedModels = this.session.scopedModels;
+		const sessionScopedModels = this.controller.scopedModels;
 		const configuredEnabledIds = (models: readonly Model<any>[]): string[] | null => {
 			if (!configuredPatterns?.length) return null;
 			const resolved = resolveModelScopeFromModels(configuredPatterns, models);
@@ -4892,14 +5005,14 @@ export class InteractiveMode {
 				enabledIds !== null && [...availableModelIds].every((id) => enabledIds.includes(id));
 			if (enabledIds && hasEnabledAvailableModel && !allAvailableModelsEnabled) {
 				const newScopedModels = resolveModelScopeFromModels(enabledIds, availableModels).scopedModels;
-				this.session.setScopedModels(
+				this.controller.setScopedModels(
 					newScopedModels.map((scoped) => ({
 						model: scoped.model,
 						thinkingLevel: scoped.thinkingLevel,
 					})),
 				);
 			} else {
-				this.session.setScopedModels([]);
+				this.controller.setScopedModels([]);
 			}
 			this.updateAvailableProviderCount();
 			this.ui.requestRender();
@@ -4987,7 +5100,7 @@ export class InteractiveMode {
 	}
 
 	private showUserMessageSelector(): void {
-		const userMessages = this.session.getUserMessagesForForking();
+		const userMessages = this.controller.getUserMessagesForForking();
 
 		if (userMessages.length === 0) {
 			this.showStatus("No messages to fork from");
@@ -5002,7 +5115,7 @@ export class InteractiveMode {
 				async (entryId) => {
 					done();
 					try {
-						const result = await this.runtimeHost.fork(entryId);
+						const result = await this.controller.fork(entryId);
 						if (result.cancelled) {
 							this.ui.requestRender();
 							return;
@@ -5032,7 +5145,7 @@ export class InteractiveMode {
 		}
 
 		try {
-			const result = await this.runtimeHost.fork(leafId, { position: "at" });
+			const result = await this.controller.fork(leafId, { position: "at" });
 			if (result.cancelled) {
 				this.ui.requestRender();
 				return;
@@ -5046,7 +5159,7 @@ export class InteractiveMode {
 	}
 
 	private showTreeSelector(initialSelectedId?: string): void {
-		const tree = this.sessionManager.getTree();
+		const tree = this.controller.getTree();
 		const realLeafId = this.sessionManager.getLeafId();
 		const initialFilterMode = this.settingsManager.getTreeFilterMode();
 
@@ -5106,9 +5219,9 @@ export class InteractiveMode {
 					}
 
 					// The user committed to navigating: stop the active response first.
-					if (this.session.isStreaming) {
+					if (this.controller.isStreaming) {
 						this.restoreQueuedMessagesToEditor();
-						await this.session.abort();
+						await this.controller.abort();
 					}
 
 					// Set up escape handler and status indicator if summarizing
@@ -5117,7 +5230,7 @@ export class InteractiveMode {
 
 					if (wantsSummary) {
 						this.defaultEditor.onEscape = () => {
-							this.session.abortBranchSummary();
+							this.controller.abortBranchSummary();
 						};
 						this.chatContainer.addChild(new Spacer(1));
 						this.showStatusIndicator(new BranchSummaryStatusIndicator(this.ui));
@@ -5126,7 +5239,7 @@ export class InteractiveMode {
 					}
 
 					try {
-						const result = await this.session.navigateTree(entryId, {
+						const result = await this.controller.navigateTree(entryId, {
 							summarize: wantsSummary,
 							customInstructions,
 						});
@@ -5149,6 +5262,22 @@ export class InteractiveMode {
 							this.editor.setText(result.editorText);
 						}
 						this.showStatus("Navigated to selected point");
+						if (
+							result.fileRevert &&
+							(result.fileRevert.reverted.length > 0 || result.fileRevert.skipped.length > 0)
+						) {
+							const { reverted, skipped } = result.fileRevert;
+							const parts: string[] = ["Navigated to selected point"];
+							if (reverted.length > 0) {
+								parts.push(`reverted ${reverted.length} file${reverted.length === 1 ? "" : "s"}`);
+							}
+							if (skipped.length > 0) {
+								parts.push(
+									`skipped ${skipped.length} externally-modified file${skipped.length === 1 ? "" : "s"}`,
+								);
+							}
+							this.showStatus(parts.join("; "));
+						}
 						void this.flushCompactionQueue({ willRetry: false });
 					} catch (error) {
 						this.showError(error instanceof Error ? error.message : String(error));
@@ -5230,7 +5359,7 @@ export class InteractiveMode {
 	): Promise<{ cancelled: boolean }> {
 		this.clearStatusIndicator();
 		try {
-			const result = await this.runtimeHost.switchSession(sessionPath, {
+			const result = await this.controller.switchSession(sessionPath, {
 				withSession: options?.withSession,
 				projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
 			});
@@ -5238,6 +5367,7 @@ export class InteractiveMode {
 				return result;
 			}
 			this.showStatus("Resumed session");
+			this.restorePendingCompactionReview(true);
 			return result;
 		} catch (error: unknown) {
 			if (error instanceof MissingSessionCwdError) {
@@ -5246,7 +5376,7 @@ export class InteractiveMode {
 					this.showStatus("Resume cancelled");
 					return { cancelled: true };
 				}
-				const result = await this.runtimeHost.switchSession(sessionPath, {
+				const result = await this.controller.switchSession(sessionPath, {
 					cwdOverride: selectedCwd,
 					withSession: options?.withSession,
 					projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
@@ -5255,6 +5385,7 @@ export class InteractiveMode {
 					return result;
 				}
 				this.showStatus("Resumed session in current cwd");
+				this.restorePendingCompactionReview(true);
 				return result;
 			}
 			return this.handleFatalRuntimeError("Failed to resume session", error);
@@ -5535,10 +5666,17 @@ export class InteractiveMode {
 				const defaultModelId = defaultModelPerProvider[providerId];
 				selectedModel = providerModels.find((model) => model.id === defaultModelId);
 				if (!selectedModel) {
-					selectionError = `${actionLabel}, but its default model "${defaultModelId}" is not available. Use /model to select a model.`;
-				} else {
+					// The catalog may have dropped the hardcoded default ID (models
+					// come and go). Fall back to the first available model instead of
+					// failing the selection.
+					selectedModel = providerModels[0];
+					this.showStatus(
+						`Default model "${defaultModelId}" is not in the ${providerId} catalog; selected ${selectedModel.id} instead.`,
+					);
+				}
+				if (selectedModel) {
 					try {
-						await this.session.setModel(selectedModel);
+						await this.controller.setModel(selectedModel);
 					} catch (error: unknown) {
 						selectedModel = undefined;
 						const errorMessage = error instanceof Error ? error.message : String(error);
@@ -5614,7 +5752,7 @@ export class InteractiveMode {
 	}
 
 	private async showApiKeyLoginDialog(providerId: string, providerName: string): Promise<void> {
-		const previousModel = this.session.model;
+		const previousModel = this.controller.model;
 
 		const dialog = new LoginDialogComponent(
 			this.ui,
@@ -5745,7 +5883,7 @@ export class InteractiveMode {
 	}
 
 	private async showLoginDialog(providerId: string, providerName: string): Promise<void> {
-		const previousModel = this.session.model;
+		const previousModel = this.controller.model;
 		const dialog = new LoginDialogComponent(this.ui, providerId, (_success, _message) => {}, providerName);
 		this.editorContainer.clear();
 		this.editorContainer.addChild(dialog);
@@ -5781,11 +5919,11 @@ export class InteractiveMode {
 	// =========================================================================
 
 	private async handleReloadCommand(): Promise<void> {
-		if (this.session.isStreaming) {
+		if (this.controller.isStreaming) {
 			this.showWarning("Wait for the current response to finish before reloading.");
 			return;
 		}
-		if (this.session.isCompacting) {
+		if (this.controller.isCompacting) {
 			this.showWarning("Wait for compaction to finish before reloading.");
 			return;
 		}
@@ -5833,7 +5971,7 @@ export class InteractiveMode {
 		};
 
 		try {
-			await this.session.reload({ beforeSessionStart: restoreChatBeforeSessionStart });
+			await this.controller.reload({ beforeSessionStart: restoreChatBeforeSessionStart });
 			restoreChatBeforeSessionStart();
 			this.keybindings.reload();
 			const activeHeader = this.customHeader ?? this.builtInHeader;
@@ -5875,10 +6013,10 @@ export class InteractiveMode {
 
 		try {
 			if (outputPath?.endsWith(".jsonl")) {
-				const filePath = this.session.exportToJsonl(outputPath);
+				const filePath = this.controller.exportToJsonl(outputPath);
 				this.showStatus(`Session exported to: ${filePath}`);
 			} else {
-				const filePath = await this.session.exportToHtml(outputPath, {
+				const filePath = await this.controller.exportToHtml(outputPath, {
 					themeName: theme.name,
 				});
 				this.showStatus(`Session exported to: ${filePath}`);
@@ -5932,7 +6070,7 @@ export class InteractiveMode {
 
 		try {
 			this.clearStatusIndicator();
-			const result = await this.runtimeHost.importFromJsonl(inputPath);
+			const result = await this.controller.importFromJsonl(inputPath);
 			if (result.cancelled) {
 				this.showStatus("Import cancelled");
 				return;
@@ -5945,7 +6083,7 @@ export class InteractiveMode {
 					this.showStatus("Import cancelled");
 					return;
 				}
-				const result = await this.runtimeHost.importFromJsonl(inputPath, selectedCwd);
+				const result = await this.controller.importFromJsonl(inputPath, selectedCwd);
 				if (result.cancelled) {
 					this.showStatus("Import cancelled");
 					return;
@@ -5962,24 +6100,17 @@ export class InteractiveMode {
 	}
 
 	private async handleShareCommand(): Promise<void> {
-		// Check if gh is available and logged in
-		try {
-			const authResult = spawnSync("gh", ["auth", "status"], { encoding: "utf-8" });
-			if (authResult.status !== 0) {
-				this.showError("GitHub CLI is not logged in. Run 'gh auth login' first.");
-				return;
-			}
-		} catch {
-			this.showError("GitHub CLI (gh) is not installed. Install it from https://cli.github.com/");
-			return;
-		}
-
 		// Export to a temp file
-		const tmpFile = path.join(os.tmpdir(), "session.html");
+		const tmpFile = path.join(os.tmpdir(), `session-${process.pid}-${Date.now()}.html`);
 		try {
-			await this.session.exportToHtml(tmpFile, { themeName: theme.name });
+			await this.controller.exportToHtml(tmpFile, { themeName: theme.name });
 		} catch (error: unknown) {
 			this.showError(`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`);
+			try {
+				fs.unlinkSync(tmpFile);
+			} catch {
+				// Ignore cleanup errors
+			}
 			return;
 		}
 
@@ -6002,61 +6133,33 @@ export class InteractiveMode {
 			}
 		};
 
-		// Create a secret gist asynchronously
-		let proc: ReturnType<typeof spawn> | null = null;
-
 		loader.onAbort = () => {
-			proc?.kill();
 			restoreEditor();
 			this.showStatus("Share cancelled");
 		};
 
 		try {
-			const result = await new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve) => {
-				proc = spawn("gh", ["gist", "create", "--public=false", tmpFile]);
-				let stdout = "";
-				let stderr = "";
-				proc.stdout?.on("data", (data) => {
-					stdout += data.toString();
-				});
-				proc.stderr?.on("data", (data) => {
-					stderr += data.toString();
-				});
-				proc.on("close", (code) => resolve({ stdout, stderr, code }));
-			});
+			const previewUrl = await shareSessionAsGist({ htmlPath: tmpFile, signal: loader.signal });
 
 			if (loader.signal.aborted) return;
 
 			restoreEditor();
-
-			if (result.code !== 0) {
-				const errorMsg = result.stderr?.trim() || "Unknown error";
-				this.showError(`Failed to create gist: ${errorMsg}`);
-				return;
-			}
-
-			// Extract gist ID from the URL returned by gh
-			// gh returns something like: https://gist.github.com/username/GIST_ID
-			const gistUrl = result.stdout?.trim();
-			const gistId = gistUrl?.split("/").pop();
-			if (!gistId) {
-				this.showError("Failed to parse gist ID from gh output");
-				return;
-			}
-
-			// Create the preview URL
-			const previewUrl = getShareViewerUrl(gistId);
-			this.showStatus(`Share URL: ${previewUrl}\nGist: ${gistUrl}`);
+			this.showStatus(`Share URL: ${previewUrl}`);
 		} catch (error: unknown) {
 			if (!loader.signal.aborted) {
 				restoreEditor();
-				this.showError(`Failed to create gist: ${error instanceof Error ? error.message : "Unknown error"}`);
+				const cause = error instanceof Error ? error.message : "Unknown error";
+				if (cause.includes("GitHub CLI") || cause.includes("gh")) {
+					this.showError(cause);
+				} else {
+					this.showError(`Failed to create gist: ${cause}`);
+				}
 			}
 		}
 	}
 
 	private async handleCopyCommand(options: { flashConfirmation?: boolean } = {}): Promise<void> {
-		const text = this.session.getLastAssistantText();
+		const text = this.controller.getLastAssistantText();
 		if (!text) {
 			this.showError("No agent messages to copy yet.");
 			return;
@@ -6088,7 +6191,7 @@ export class InteractiveMode {
 			return;
 		}
 
-		this.session.setSessionName(name);
+		this.controller.setSessionName(name);
 		const sessionName = this.sessionManager.getSessionName();
 		if (sessionName !== name) {
 			this.showWarning(`Session name was normalized from ${JSON.stringify(name)} to ${JSON.stringify(sessionName)}`);
@@ -6099,7 +6202,7 @@ export class InteractiveMode {
 	}
 
 	private handleSessionCommand(): void {
-		const stats = this.session.getSessionStats();
+		const stats = this.controller.getSessionStats();
 		const sessionName = this.sessionManager.getSessionName();
 		const entries = this.sessionManager.getEntries();
 		const cacheWaste = computeCacheWaste(entries, this.session.modelRuntime);
@@ -6194,6 +6297,452 @@ export class InteractiveMode {
 	 */
 	private getEditorKeyDisplay(action: Keybinding): string {
 		return keyDisplayText(action);
+	}
+
+	private bgTasks(): BackgroundTasksIntegration | undefined {
+		return this.controller.getIntegration<BackgroundTasksIntegration>("bg-tasks");
+	}
+
+	/**
+	 * Restore a pending compaction review from the latest compaction entry.
+	 * The reviewed flag and dismissed markers are persisted in the session
+	 * file, so /review keeps working across restarts.
+	 */
+	private restorePendingCompactionReview(notify = false): void {
+		if (this.pendingCompactionReview) return;
+		const entry = this.sessionManager.getLatestCompactionEntry();
+		if (!entry) return;
+		const details = entry.details as Record<string, unknown> | undefined;
+		if (details?.reviewedAt) return;
+		const uncertain = parseUncertainItems(entry.summary);
+		if (uncertain.length === 0) return;
+		this.pendingCompactionReview = { entryId: entry.id, summary: entry.summary };
+		if (notify) {
+			this.showStatus(`Compaction review pending: ${uncertain.length} unverified items — /review to inspect`);
+		}
+	}
+
+	/** Guard against overlapping uncertainty review popups. */
+	private uncertaintyReviewOpen = false;
+
+	/**
+	 * Incremental uncertainty review: when the agent settles (run fully idle)
+	 * and the model flagged unverified claims, prompt the user immediately
+	 * instead of letting them pile up until post-compaction review.
+	 */
+	private async maybeShowUncertaintyReview(): Promise<void> {
+		if (this.uncertaintyReviewOpen) return;
+		// Auto-review mode: the model settles flags itself; no user popup.
+		if (this.settingsManager.getUncertaintyReviewAuto()) return;
+		if (this.settingsManager.getUncertaintyReviewTiming() !== "incremental") return;
+		const store = this.session.uncertaintyStore;
+		const pending = store.pending();
+		if (pending.length === 0) return;
+		this.uncertaintyReviewOpen = true;
+		try {
+			await this.showUncertaintyReview(pending);
+		} finally {
+			this.uncertaintyReviewOpen = false;
+		}
+	}
+
+	/**
+	 * Confirmation popup for the auto-review overturning a user ruling:
+	 * Enter accepts the change, Esc keeps the original ruling. The answer
+	 * is handed back through the session so the awaiting review pass can
+	 * continue (300s budget, timeout keeps the ruling).
+	 */
+	private async confirmUserRulingOverride(proposal: {
+		flagId: string;
+		claim: string;
+		decision: "verified" | "dismissed" | "corrected";
+		correction?: string;
+	}): Promise<void> {
+		let accepted = false;
+		let closed = false;
+		await this.showExtensionCustom<void>(
+			(_tui, componentTheme, _kb, done) => {
+				const A = (s: string) => componentTheme.fg("accent", componentTheme.bold(s));
+				const M = (s: string) => componentTheme.fg("dim", s);
+				const G = (s: string) => componentTheme.fg("success", s);
+				const H = (s: string) => componentTheme.fg("warning", s);
+				const close = (ok: boolean) => {
+					if (closed) return;
+					closed = true;
+					accepted = ok;
+					done();
+				};
+				const rulingLabel =
+					proposal.decision === "verified"
+						? "verified (keep)"
+						: proposal.decision === "dismissed"
+							? "dismissed (drop)"
+							: `corrected → ${proposal.correction ?? ""}`;
+				return {
+					render: () => [
+						"",
+						A(" Ruling Change"),
+						M(" The auto-review proposes to overturn a ruling you made earlier:"),
+						` ${proposal.claim}`,
+						` ${G("→")} ${rulingLabel}`,
+						"",
+						` ${G("Enter")} ${M("accept change")}  ${H("Esc")} ${M("keep original")}`,
+						"",
+					],
+					handleInput: (data: string) => {
+						if (data === "\r") {
+							close(true);
+							return false;
+						}
+						if (data === "\x1b") {
+							close(false);
+							return false;
+						}
+						return true;
+					},
+					invalidate: () => {},
+				};
+			},
+			{ overlay: true },
+		);
+		this.controller.respondOverrideConfirmation(accepted);
+	}
+
+	/** Show the review popup for a batch of pending flags and apply the results. */
+	private async showUncertaintyReview(pending: UncertainFlag[]): Promise<void> {
+		const store = this.session.uncertaintyStore;
+		const max = this.settingsManager.getUncertaintyReviewMaxPerPrompt();
+		const batch = pending.slice(0, Math.max(1, max));
+		const widget = new UncertaintyReviewWidget(batch, pending.length - batch.length);
+		const result = await this.showExtensionCustom<UncertaintyReviewResult>(
+			(_tui, _componentTheme, _kb, done) => {
+				const control = widget.start(done);
+				return {
+					render: (w: number) => control.render(w),
+					handleInput: (data: string) => control.handleInput(data),
+					invalidate: () => control.invalidate(),
+				};
+			},
+			{ overlay: true },
+		);
+		const corrections: string[] = [];
+		let decidedCount = 0;
+		for (const [flagId, outcome] of result.decisions) {
+			if (store.decide(flagId, outcome.decision, outcome.correction)) {
+				decidedCount++;
+				if (outcome.decision === "corrected" && outcome.correction) {
+					const flag = batch.find((f) => f.id === flagId);
+					corrections.push(`- "${flag?.claim ?? flagId}" → 更正：${outcome.correction}`);
+				}
+			}
+		}
+		if (decidedCount > 0) {
+			const remaining = store.pending().length;
+			const suffix = remaining > 0 ? ` ${remaining} still pending.` : "";
+			this.showStatus(`Reviewed ${decidedCount} flagged claim(s).${suffix}`);
+		}
+		// Corrections steer the conversation back onto verified facts.
+		if (corrections.length > 0) {
+			await this.controller.followUp(
+				`用户审核了你标记的不确定条目，以下更正立即生效：\n${corrections.join("\n")}\n请按更正后的事实继续。`,
+			);
+		}
+	}
+
+	/** /review: unified review — un-reviewed compaction items, then pending flags, then decided flags. */
+	private async handleReviewCommand(): Promise<void> {
+		// 1. Un-reviewed compaction items (keep/abandon).
+		if (await this.handleCompactionReviewCommand()) return;
+
+		// 2. Pending uncertainty flags.
+		const store = this.session.uncertaintyStore;
+		const pending = store.pending();
+		if (pending.length > 0) {
+			await this.showUncertaintyReview(pending);
+			return;
+		}
+		// 3. Browse already-decided flags.
+		const decided = store.decisions();
+		if (decided.length === 0) {
+			this.showStatus("No flagged uncertainty claims in this session.");
+			return;
+		}
+		const widget = new UncertaintyBrowseWidget(decided);
+		const result = await this.showExtensionCustom<UncertaintyBrowseResult>(
+			(_tui, _componentTheme, _kb, done) => {
+				const control = widget.start(done);
+				return {
+					render: (w: number) => control.render(w),
+					handleInput: (data: string) => control.handleInput(data),
+					invalidate: () => control.invalidate(),
+				};
+			},
+			{ overlay: true },
+		);
+		for (const flagId of result.requeue) {
+			store.requeue(flagId, "re-queued via /review");
+		}
+		const corrections: string[] = [];
+		for (const [flagId, outcome] of result.overrides) {
+			if (store.overrideDecision(flagId, outcome.decision, outcome.correction)) {
+				if (outcome.decision === "corrected" && outcome.correction) {
+					const flag = decided.find((f) => f.flagId === flagId);
+					corrections.push(`- "${flag?.claim ?? flagId}" → 更正：${outcome.correction}`);
+				}
+			}
+		}
+		if (result.requeue.length > 0) {
+			this.showStatus(`${result.requeue.length} item(s) re-queued for review.`);
+		}
+		if (corrections.length > 0) {
+			await this.controller.followUp(
+				`用户更新了对不确定条目的审核结论，以下更正立即生效：\n${corrections.join("\n")}\n请按更正后的事实继续。`,
+			);
+		}
+	}
+
+	/** Compaction review (keep/abandon) for the pending un-reviewed summary. Returns true when handled. */
+	private async handleCompactionReviewCommand(): Promise<boolean> {
+		if (!this.pendingCompactionReview) {
+			// Lazy restore: covers session switches that bypassed the notify paths.
+			this.restorePendingCompactionReview();
+		}
+		if (!this.pendingCompactionReview) {
+			return false;
+		}
+
+		const { entryId, summary } = this.pendingCompactionReview;
+		const items = parseUncertainItems(summary);
+		if (items.length === 0) {
+			this.showStatus("No unverified items to review.");
+			this.session.sessionManager.markCompactionReviewed(entryId);
+			this.pendingCompactionReview = undefined;
+			return true;
+		}
+
+		const widget = new CompactionReviewWidget(items);
+		await this.showExtensionCustom<void>((_tui, _componentTheme, _kb, done) => {
+			const control = widget.start((result) => {
+				if (result.dismissedLines.size > 0) {
+					const newSummary = dismissItems(summary, result.dismissedLines);
+					this.session.sessionManager.updateCompactionSummary(entryId, newSummary);
+					this.showStatus(`Review complete. ${result.dismissedLines.size} item(s) dismissed.`);
+					// Rebuild chat to reflect updated summary.
+					this.chatContainer.clear();
+					this.rebuildChatFromMessages();
+				} else {
+					this.showStatus("Review complete. All items kept.");
+				}
+				// Persisted so the review is not offered again after a restart.
+				this.session.sessionManager.markCompactionReviewed(entryId);
+				this.pendingCompactionReview = undefined;
+				done();
+			});
+			return {
+				render: (w: number) => control.render(w),
+				handleInput: (data: string) => control.handleInput(data),
+				invalidate: () => control.invalidate(),
+			};
+		});
+		return true;
+	}
+
+	/**
+	 * Background-task manager widget: focusable list (↑↓ select, Enter view,
+	 * k kill, Esc back). Mounted by /tasks and removed when closed — it never
+	 * lingers on screen after Esc.
+	 */
+	private _bgTasksWidget: BgTasksWidget | undefined;
+	/** Key of the currently shown /fg task-output widget (only one at a time). */
+	private lastTaskWidgetKey: string | undefined;
+
+	/** Remove the task-manager widget (and any preview) and return focus to the editor. */
+	private closeBgTaskManager(): void {
+		this._bgTasksWidget?.dispose();
+		this.setExtensionWidget("bg-tasks", undefined);
+		this.setExtensionWidget("task-preview", undefined);
+		this._bgTasksWidget = undefined;
+		this.ui.setFocus(this.editor);
+	}
+
+	private toggleBgTaskManager(): void {
+		const bg = this.bgTasks();
+		if (!bg) {
+			this.showWarning('Background tasks are disabled. Enable via "backgroundTasks": { "enabled": true }.');
+			return;
+		}
+		const focused = this._bgTasksWidget?.focused === true;
+		if (focused || this._bgTasksWidget) {
+			this.closeBgTaskManager();
+			this.showStatus("Background task manager closed.");
+			return;
+		}
+		this._bgTasksWidget = new BgTasksWidget({
+			getTasks: () =>
+				[...bg.store.list()].sort((a, b) => {
+					const ar = a.status === "running" ? 1 : 0;
+					const br = b.status === "running" ? 1 : 0;
+					if (ar !== br) return br - ar;
+					return (b.startTime ?? 0) - (a.startTime ?? 0);
+				}),
+			onView: (id) => void this.showTaskPreview(id),
+			onBackFromView: () => this.setExtensionWidget("task-preview", undefined),
+			onKill: (id) => bg.killTask(id),
+			onExit: () => {
+				this.closeBgTaskManager();
+				this.showStatus("Background task manager closed.");
+			},
+			height: InteractiveMode.maxWidgetLines(),
+		});
+		this.setExtensionWidget("bg-tasks", () => this._bgTasksWidget!);
+		this.ui.setFocus(this._bgTasksWidget);
+		this._bgTasksWidget.refresh();
+		this.ui.requestRender();
+	}
+
+	/**
+	 * Preview panel for the task manager: the task's latest 5 output lines.
+	 * Dismissed by Esc (back to the task list) — never lingers.
+	 * Only running tasks are viewable; finished tasks were already delivered
+	 * with their completion notice and their records are reaped.
+	 */
+	private async showTaskPreview(id: string): Promise<void> {
+		const bg = this.bgTasks();
+		if (!bg) {
+			this.showWarning('Background tasks are disabled. Enable via "backgroundTasks": { "enabled": true }.');
+			return;
+		}
+		const task = bg.store.get(id);
+		if (!task) {
+			this.showError(`Task ${id} not found.`);
+			return;
+		}
+		if (task.status !== "running") {
+			this.showError(
+				`Task ${id} has finished (${task.status}) — its output was delivered with the completion notice.`,
+			);
+			return;
+		}
+		const result = await bg.taskOutput(id);
+		if (!result) {
+			this.showError(`Task ${id} not found.`);
+			return;
+		}
+		const { task: t, output } = result;
+		const lines = output.split("\n").slice(-5);
+		const maxLine = Math.max(this.ui.terminal.columns - 4, 20);
+		this.setExtensionWidget("task-preview", [
+			`┌─ ${id} [${t.status}]${t.exitCode != null ? ` exit=${t.exitCode}` : ""}`,
+			...(t.label ? [`│ ${t.label}`] : []),
+			...lines.map((l: string) => `│ ${l.substring(0, maxLine)}`),
+			`│ Esc back to tasks  |  /fg ${id} for full output`,
+			"└─",
+		]);
+	}
+
+	private async handleFgCommand(id: string): Promise<void> {
+		const bg = this.bgTasks();
+		if (!bg) {
+			this.showWarning('Background tasks are disabled. Enable via "backgroundTasks": { "enabled": true }.');
+			return;
+		}
+		const full = id.includes("--full");
+		id = id.replace(/\s*--full\s*/, "").trim();
+		if (!id) {
+			this.showWarning("Usage: /fg <task-id> [--full]");
+			return;
+		}
+		const task = bg.store.get(id);
+		if (!task) {
+			this.showError(`Task ${id} not found.`);
+			return;
+		}
+		if (task.status !== "running") {
+			this.showError(
+				`Task ${id} has finished (${task.status}) — its output was already delivered with the completion notice and the task record is reaped. Use /tasks for running tasks.`,
+			);
+			return;
+		}
+		const result = await bg.taskOutput(id);
+		if (!result) {
+			this.showError(`Task ${id} not found.`);
+			return;
+		}
+		const { task: t, output } = result;
+		const lines = output.split("\n");
+		const shown = full ? lines : lines.slice(-50);
+		const hidden = lines.length - shown.length;
+		const maxLine = Math.max(this.ui.terminal.columns - 4, 20);
+		// Only one task-output widget at a time — clear the previous one.
+		if (this.lastTaskWidgetKey && this.lastTaskWidgetKey !== `task-${id}`) {
+			this.setExtensionWidget(this.lastTaskWidgetKey, undefined);
+		}
+		this.lastTaskWidgetKey = `task-${id}`;
+		this.setExtensionWidget(
+			`task-${id}`,
+			[
+				`┌─ ${id} [${t.status}]${t.exitCode != null ? ` exit=${t.exitCode}` : ""}`,
+				`│ $ ${t.description}`, // full command, never truncated
+				...(full ? shown.map((l: string) => `│ ${l}`) : shown.map((l: string) => `│ ${l.substring(0, maxLine)}`)),
+				!full && hidden > 0 ? `│ ... (${hidden} earlier lines hidden, use /fg ${id} --full)` : "",
+				`│ log: ${t.logFile}`,
+				"└─",
+			].filter(Boolean),
+		);
+	}
+
+	private async handleKillCommand(id: string): Promise<void> {
+		const bg = this.bgTasks();
+		if (!bg) {
+			this.showWarning('Background tasks are disabled. Enable via "backgroundTasks": { "enabled": true }.');
+			return;
+		}
+		if (!id) {
+			this.showWarning("Usage: /kill <task-id>");
+			return;
+		}
+		if (await bg.killTask(id)) {
+			this.showStatus(`Killed ${id}.`);
+		} else {
+			this.showError(`Task ${id} not found.`);
+		}
+	}
+
+	private async handleAttachCommand(id: string): Promise<void> {
+		const bg = this.bgTasks();
+		if (!bg) {
+			this.showWarning('Background tasks are disabled. Enable via "backgroundTasks": { "enabled": true }.');
+			return;
+		}
+		if (!id) {
+			this.showWarning("Usage: /attach <task-id>");
+			return;
+		}
+		const task = bg.store.get(id);
+		if (!task || task.status !== "running") {
+			this.showError(`Task ${id} is not running.`);
+			return;
+		}
+		this.ui.stop();
+		try {
+			await new Promise<void>((resolve) => {
+				const proc = spawn("tmux", ["attach-session", "-t", id], { stdio: "inherit" });
+				proc.on("exit", () => resolve());
+				proc.on("error", () => resolve());
+			});
+		} finally {
+			this.ui.start();
+			this.ui.requestRender(true);
+		}
+	}
+
+	private async handleSshCommand(args: string): Promise<void> {
+		const ssh = this.controller.getIntegration<SshIntegration>("ssh");
+		if (!ssh) {
+			this.showWarning('SSH integration is disabled. Enable via "ssh": { "enabled": true }.');
+			return;
+		}
+		await ssh.handleCommand(args);
 	}
 
 	private handleHotkeysCommand(): void {
@@ -6316,7 +6865,7 @@ export class InteractiveMode {
 	private async handleClearCommand(): Promise<void> {
 		this.clearStatusIndicator();
 		try {
-			const result = await this.runtimeHost.newSession();
+			const result = await this.controller.newSession();
 			if (result.cancelled) {
 				return;
 			}
@@ -6347,7 +6896,7 @@ export class InteractiveMode {
 			}),
 			"",
 			"=== Agent messages (JSONL) ===",
-			...this.session.messages.map((msg) => JSON.stringify(msg)),
+			...this.controller.messages.map((msg) => JSON.stringify(msg)),
 			"",
 		].join("\n");
 
@@ -6402,7 +6951,7 @@ export class InteractiveMode {
 
 			// Create UI component for display
 			this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext);
-			if (this.session.isStreaming) {
+			if (this.controller.isStreaming) {
 				this.pendingMessagesContainer.addChild(this.bashComponent);
 				this.pendingBashComponents.push(this.bashComponent);
 			} else {
@@ -6421,14 +6970,14 @@ export class InteractiveMode {
 			);
 
 			// Record the result in session
-			this.session.recordBashResult(command, result, { excludeFromContext });
+			this.controller.recordBashResult(command, result, { excludeFromContext });
 			this.bashComponent = undefined;
 			this.ui.requestRender();
 			return;
 		}
 
 		// Normal execution path (possibly with custom operations)
-		const isDeferred = this.session.isStreaming;
+		const isDeferred = this.controller.isStreaming;
 		this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext);
 
 		if (isDeferred) {
@@ -6442,7 +6991,7 @@ export class InteractiveMode {
 		this.ui.requestRender();
 
 		try {
-			const result = await this.session.executeBash(
+			const result = await this.controller.executeBash(
 				command,
 				(chunk) => {
 					if (this.bashComponent) {
@@ -6476,7 +7025,7 @@ export class InteractiveMode {
 		this.clearStatusIndicator();
 
 		try {
-			await this.session.compact(customInstructions);
+			await this.controller.compact(customInstructions);
 		} catch {
 			// Ignore, will be emitted as an event
 		}

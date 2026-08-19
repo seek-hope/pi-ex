@@ -3,7 +3,7 @@
  * Used by auth-storage.ts and model-registry.ts.
  */
 
-import { execSync, spawnSync } from "child_process";
+import { spawnSync } from "child_process";
 import { getShellConfig } from "../utils/shell.ts";
 
 // Cache for shell command results (persists for process lifetime)
@@ -150,14 +150,23 @@ export function resolveConfigValue(config: string, env?: Record<string, string>)
 	return resolveTemplate(reference.parts, env);
 }
 
-function executeWithConfiguredShell(command: string): { executed: boolean; value: string | undefined } {
+// Stdout cap for `!command` config values: a runaway command cannot flood
+// memory past this, mirroring the bash tool's truncation approach.
+const COMMAND_MAX_OUTPUT_BYTES = 1 * 1024 * 1024;
+// Default timeout for `!command` config value execution.
+const COMMAND_TIMEOUT_MS = 10000;
+
+type CommandExecResult = { executed: boolean; value: string | undefined; reason?: string };
+
+export function executeWithConfiguredShell(command: string): CommandExecResult {
 	try {
 		const { shell, args, commandTransport } = getShellConfig();
 		const commandFromStdin = commandTransport === "stdin";
 		const result = spawnSync(shell, commandFromStdin ? args : [...args, command], {
 			encoding: "utf-8",
 			input: commandFromStdin ? command : undefined,
-			timeout: 10000,
+			timeout: COMMAND_TIMEOUT_MS,
+			maxBuffer: COMMAND_MAX_OUTPUT_BYTES,
 			stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "ignore"],
 			shell: false,
 			windowsHide: true,
@@ -166,43 +175,78 @@ function executeWithConfiguredShell(command: string): { executed: boolean; value
 		if (result.error) {
 			const error = result.error as NodeJS.ErrnoException;
 			if (error.code === "ENOENT") {
-				return { executed: false, value: undefined };
+				return { executed: false, value: undefined, reason: "shell not found" };
 			}
-			return { executed: true, value: undefined };
+			if ((error as { killed?: boolean }).killed) {
+				return { executed: true, value: undefined, reason: `timed out after ${COMMAND_TIMEOUT_MS}ms` };
+			}
+			return { executed: true, value: undefined, reason: error.message };
 		}
 
 		if (result.status !== 0) {
-			return { executed: true, value: undefined };
+			return { executed: true, value: undefined, reason: `exited with status ${result.status}` };
 		}
 
 		const value = (result.stdout ?? "").trim();
 		return { executed: true, value: value || undefined };
-	} catch {
-		return { executed: false, value: undefined };
+	} catch (error) {
+		return {
+			executed: false,
+			value: undefined,
+			reason: error instanceof Error ? error.message : String(error),
+		};
 	}
 }
 
-function executeWithDefaultShell(command: string): string | undefined {
+function executeWithDefaultShell(command: string): CommandExecResult {
 	try {
-		const output = execSync(command, {
+		// Use spawnSync (never execSync) so a malformed or huge command can't
+		// run unbounded: shell:true keeps compat with existing configs that use
+		// pipes/globs, with a 10s timeout and a capped stdout buffer.
+		const result = spawnSync(command, {
+			shell: true,
 			encoding: "utf-8",
-			timeout: 10000,
+			timeout: COMMAND_TIMEOUT_MS,
+			maxBuffer: COMMAND_MAX_OUTPUT_BYTES,
 			stdio: ["ignore", "pipe", "ignore"],
 		});
-		return output.trim() || undefined;
-	} catch {
-		return undefined;
+
+		if (result.error) {
+			const error = result.error as NodeJS.ErrnoException;
+			if ((error as { killed?: boolean }).killed) {
+				return { executed: true, value: undefined, reason: `timed out after ${COMMAND_TIMEOUT_MS}ms` };
+			}
+			return { executed: true, value: undefined, reason: error.message };
+		}
+
+		if (result.status !== 0) {
+			return { executed: true, value: undefined, reason: `exited with status ${result.status}` };
+		}
+
+		const output = (result.stdout ?? "").trim();
+		return { executed: true, value: output || undefined };
+	} catch (error) {
+		return {
+			executed: false,
+			value: undefined,
+			reason: error instanceof Error ? error.message : String(error),
+		};
 	}
 }
 
-function executeCommandUncached(commandConfig: string): string | undefined {
+function executeCommandUncached(commandConfig: string): { value: string | undefined; reason?: string } {
 	const command = commandConfig.slice(1);
-	return process.platform === "win32"
-		? (() => {
-				const configuredResult = executeWithConfiguredShell(command);
-				return configuredResult.executed ? configuredResult.value : executeWithDefaultShell(command);
-			})()
-		: executeWithDefaultShell(command);
+	const resolveCommand = (): CommandExecResult => {
+		if (process.platform === "win32") {
+			const configured = executeWithConfiguredShell(command);
+			if (configured.executed) return configured;
+			const fallback = executeWithDefaultShell(command);
+			return { executed: true, value: fallback.value, reason: fallback.reason };
+		}
+		return executeWithDefaultShell(command);
+	};
+	const result = resolveCommand();
+	return { value: result.value, reason: result.reason };
 }
 
 function executeCommand(commandConfig: string): string | undefined {
@@ -211,8 +255,8 @@ function executeCommand(commandConfig: string): string | undefined {
 	}
 
 	const result = executeCommandUncached(commandConfig);
-	commandResultCache.set(commandConfig, result);
-	return result;
+	commandResultCache.set(commandConfig, result.value);
+	return result.value;
 }
 
 /**
@@ -221,20 +265,25 @@ function executeCommand(commandConfig: string): string | undefined {
 export function resolveConfigValueUncached(config: string, env?: Record<string, string>): string | undefined {
 	const reference = parseConfigValueReference(config);
 	if (reference.type === "command") {
-		return executeCommandUncached(reference.config);
+		return executeCommandUncached(reference.config).value;
 	}
 	return resolveTemplate(reference.parts, env);
 }
 
 export function resolveConfigValueOrThrow(config: string, description: string, env?: Record<string, string>): string {
-	const resolvedValue = resolveConfigValueUncached(config, env);
-	if (resolvedValue !== undefined) {
-		return resolvedValue;
-	}
-
 	const reference = parseConfigValueReference(config);
 	if (reference.type === "command") {
-		throw new Error(`Failed to resolve ${description} from shell command: ${reference.config.slice(1)}`);
+		const result = executeCommandUncached(reference.config);
+		if (result.value !== undefined) {
+			return result.value;
+		}
+		const detail = result.reason ? ` (${result.reason})` : "";
+		throw new Error(`Failed to resolve ${description} from shell command: ${reference.config.slice(1)}${detail}`);
+	}
+
+	const resolvedValue = resolveTemplate(reference.parts, env);
+	if (resolvedValue !== undefined) {
+		return resolvedValue;
 	}
 
 	if (reference.type === "template") {

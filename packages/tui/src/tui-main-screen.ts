@@ -177,6 +177,19 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		return this.deleteKittyImages(ids);
 	}
 
+	/** Clear the terminal scrollback and reset render state (e.g. after compaction). */
+	clearScrollback(): void {
+		if (this.stopped) return;
+		this.terminal.write(this.deleteKittyImages(this.previousKittyImageIds));
+		this.terminal.write("\x1b[2J\x1b[H\x1b[3J"); // Clear screen, home, clear scrollback
+		this.previousLines = [];
+		this.previousKittyImageIds = new Set();
+		this.maxLinesRendered = 0;
+		this.previousWidth = 0;
+		this.previousHeight = 0;
+		this.requestRender(true);
+	}
+
 	protected doRender(): void {
 		if (this.stopped) return;
 		const width = this.terminal.columns;

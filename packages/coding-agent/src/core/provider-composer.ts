@@ -426,6 +426,11 @@ export function composeModelProvider(
 	const config = modelConfig.getProvider(providerId);
 	let extensionOAuthCredential: OAuthCredentials | undefined;
 	let refreshedExtensionModels: ProviderConfigInput["models"];
+	// Coalesce concurrent refreshModels calls: a refresh writes shared closure state
+	// (refreshedExtensionModels / extensionOAuthCredential), so running N in parallel
+	// lets a slower one clobber the result of a newer one (lost update). Joining an
+	// in-flight pass keeps the shared state consistent and avoids duplicate network.
+	let inFlightRefresh: Promise<void> | undefined;
 	const currentExtension = (): ProviderConfigInput | undefined =>
 		extension && refreshedExtensionModels ? { ...extension, models: refreshedExtensionModels } : extension;
 	// models.json modelOverrides are the topmost user-config layer: they apply once,
@@ -483,24 +488,38 @@ export function composeModelProvider(
 		refreshModels:
 			base?.refreshModels || extension?.refreshModels || extension?.oauth?.modifyModels
 				? async (context) => {
-						await base?.refreshModels?.(context);
-						let refreshed: NonNullable<ProviderConfigInput["models"]> | undefined;
-						if (extension?.refreshModels) refreshed = await extension.refreshModels(context);
-						if (context.signal.aborted) return;
-						const oauthCredential = context.credential?.type === "oauth" ? context.credential : undefined;
-						await context.publish({
-							update: () => {
-								if (refreshed) {
-									// Validate before publishing the new synchronous list.
-									applyExtension(providerId, applyModelsJson(providerId, base?.getModels() ?? [], config), {
-										...extension,
-										models: refreshed,
-									});
-									refreshedExtensionModels = refreshed;
-								}
-								extensionOAuthCredential = oauthCredential;
-							},
+						const runRefresh = async (): Promise<void> => {
+							await base?.refreshModels?.(context);
+							if (context.signal.aborted) return;
+							let refreshed: NonNullable<ProviderConfigInput["models"]> | undefined;
+							if (extension?.refreshModels) {
+								refreshed = await extension.refreshModels(context);
+								if (context.signal.aborted) return;
+							}
+							const oauthCredential = context.credential?.type === "oauth" ? context.credential : undefined;
+							await context.publish({
+								update: () => {
+									if (refreshed) {
+										// Validate before publishing the new synchronous list.
+										applyExtension(providerId, applyModelsJson(providerId, base?.getModels() ?? [], config), {
+											...extension,
+											models: refreshed,
+										});
+										refreshedExtensionModels = refreshed;
+									}
+									extensionOAuthCredential = oauthCredential;
+								},
+							});
+						};
+						// Join an in-flight pass so concurrent refreshes can't clobber each
+						// other's shared-state writes (lost update) or fan out duplicate work.
+						if (inFlightRefresh) return inFlightRefresh;
+						const promise = runRefresh();
+						inFlightRefresh = promise;
+						void promise.finally(() => {
+							if (inFlightRefresh === promise) inFlightRefresh = undefined;
 						});
+						return promise;
 					}
 				: undefined,
 		filterModels: base?.filterModels

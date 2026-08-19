@@ -1270,8 +1270,11 @@ export function getLanguageFromPath(filePath: string): string | undefined {
 
 export function getMarkdownTheme(): MarkdownTheme {
 	return {
-		heading: (text: string) => theme.fg("mdHeading", text),
-		link: (text: string) => theme.fg("mdLink", text),
+		// Codex-style headings: no color, hierarchy via weight (h1 is bold +
+		// underlined in codex; we approximate with bold for all levels).
+		heading: (text: string) => theme.bold(theme.fg("mdHeading", text)),
+		// Codex-style links: cyan + underlined.
+		link: (text: string) => theme.underline(theme.fg("mdLink", text)),
 		linkUrl: (text: string) => theme.fg("mdLinkUrl", text),
 		code: (text: string) => theme.fg("mdCode", text),
 		codeBlock: (text: string) => theme.fg("mdCodeBlock", text),

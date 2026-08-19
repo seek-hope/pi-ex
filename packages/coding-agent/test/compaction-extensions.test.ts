@@ -99,7 +99,7 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 
 		const sessionManager = SessionManager.create(tempDir);
 		const settingsManager = SettingsManager.create(tempDir, tempDir);
-		settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
+		settingsManager.applyOverrides({ compaction: { keepRecentRounds: 1 } });
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		const modelRegistry = await createModelRegistry(authStorage);
 
@@ -144,9 +144,7 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 		const beforeEvent = beforeCompactEvents[0];
 		expect(beforeEvent.preparation).toBeDefined();
 		expect(beforeEvent.preparation.messagesToSummarize).toBeDefined();
-		expect(beforeEvent.preparation.turnPrefixMessages).toBeDefined();
 		expect(beforeEvent.preparation.tokensBefore).toBeGreaterThanOrEqual(0);
-		expect(typeof beforeEvent.preparation.isSplitTurn).toBe("boolean");
 		expect(beforeEvent.branchEntries).toBeDefined();
 		// sessionManager, modelRegistry, and model are now on ctx, not event
 
@@ -369,11 +367,9 @@ describe.skipIf(!API_KEY)("Compaction extensions", () => {
 
 		expect(capturedBeforeEvent).not.toBeNull();
 		const event = capturedBeforeEvent!;
-		expect(typeof event.preparation.isSplitTurn).toBe("boolean");
 		expect(event.preparation.firstKeptEntryId).toBeDefined();
 
 		expect(Array.isArray(event.preparation.messagesToSummarize)).toBe(true);
-		expect(Array.isArray(event.preparation.turnPrefixMessages)).toBe(true);
 
 		expect(typeof event.preparation.tokensBefore).toBe("number");
 

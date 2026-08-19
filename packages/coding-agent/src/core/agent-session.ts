@@ -13,8 +13,10 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { execFile as execFileCb } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { basename, dirname, join as joinPath, relative as relativePath } from "node:path";
+import { promisify } from "node:util";
 import type {
 	Agent,
 	AgentEvent,
@@ -25,6 +27,9 @@ import type {
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import { contentText } from "@earendil-works/pi-ai";
+
+const execFileAsync = promisify(execFileCb);
+
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -54,17 +59,31 @@ import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import {
+	type AutoReviewCandidate,
+	parseConflictIds,
+	runAutoReview,
+	type UserOverrideProposal,
+} from "./compaction/auto-review.ts";
+import { compactStructured } from "./compaction/checkpoint.ts";
+import { completeSummarization } from "./compaction/compaction.ts";
+import { runContentDedup } from "./compaction/content-dedup.ts";
+import type { TaskContract } from "./compaction/contract.ts";
+import {
+	type CompactionDetails,
 	type CompactionPreparation,
 	type CompactionResult,
-	calculateContextTokens,
-	collectEntriesForBranchSummary,
 	compact,
 	estimateContextTokens,
 	estimateTokens,
-	generateBranchSummary,
 	prepareCompaction,
 	shouldCompact,
-} from "./compaction/index.ts";
+} from "./compaction/fork.ts";
+import { estimateTextTokens } from "./compaction/fork-utils.ts";
+import { calculateContextTokens, collectEntriesForBranchSummary, generateBranchSummary } from "./compaction/index.ts";
+import type { ActionLedger } from "./compaction/ledger.ts";
+import { autoReviewSummaryItems } from "./compaction/summary-review.ts";
+import { UNCERTAINTY_PROTOCOL_PROMPT, UncertaintyStore } from "./compaction/uncertainty.ts";
+import { computeFileLists } from "./compaction/utils.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
@@ -96,21 +115,37 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import { FileContextTracker, formatFileTime } from "./file-context.ts";
+import { FileChangeHistory, type FileRevertResult } from "./file-history.ts";
+import { registerForkHost } from "./fork-host.ts";
+import type { BackgroundTasksIntegration } from "./integrations/bg-tasks/index.ts";
+import { IntegrationFollowUpBatcher } from "./integrations/followup-batcher.ts";
+import { IntegrationManager } from "./integrations/manager.ts";
+import type { CoreIntegration } from "./integrations/types.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
-import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.ts";
+import {
+	CURRENT_SESSION_VERSION,
+	getLatestCompactionEntry,
+	type SessionHeader,
+	sessionEntryToContextMessages,
+} from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
-import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
+import type { AskUserResult } from "./tools/ask-user.ts";
+import { type BashOperations, createLocalBashOperations, type LocalSudoHandler } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
+import { extractChangedIdentifiers, runPostEditScan } from "./tools/post-edit-scan.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
+import type { WaitScheduleResult } from "./tools/wait.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
+import { WORK_LOOP_GUIDANCE } from "./work-loop-guidance.ts";
 
 // ============================================================================
 // Skill Block Parsing
@@ -182,7 +217,16 @@ export type AgentSessionEvent =
 	  }
 	| { type: "summarization_retry_finished" }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
-	| { type: "bash_execution_update"; id?: string; delta: string };
+	| { type: "bash_execution_update"; id?: string; delta: string }
+	| {
+			type: "uncertainty_override_request";
+			proposal: {
+				flagId: string;
+				claim: string;
+				decision: "verified" | "dismissed" | "corrected";
+				correction?: string;
+			};
+	  };
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
@@ -297,8 +341,41 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 // Constants
 // ============================================================================
 
+/**
+ * Upper bound on post-agent-run continuations (retry/compaction chain) before we
+ * give up, preventing an endless auto-continue loop that never yields to the user.
+ */
+const MAX_AGENT_RUN_CONTINUATIONS = 30;
+
+/**
+ * User-role reminder sent to the model right before a compaction when the
+ * todo list has unfinished model-owned items: refresh the todo first so the
+ * freshest state lands inside the compaction window (and the summary).
+ */
+const TODO_COMPACTION_REMINDER = `[system-reminder] Session compaction is about to start: the conversation will be summarized and older messages discarded. Update your todo list to reflect the current state of the work before that happens:
+- Mark items you completed as completed.
+- Keep unfinished items (reword them if the plan changed).
+- Cancel items that are no longer relevant.
+Then end your turn — compaction continues automatically.`;
+
+/** Output budget for the pre-compaction todo refresh turn — it only rewrites the todo list. */
+const TODO_REFRESH_MAX_TOKENS = 4096;
+
 /** Standard thinking levels */
 const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"];
+
+/**
+ * Minimum structural shape of the todo integration this module relies on, so
+ * the pre-compaction refresh and stale-todo warning don't depend on the
+ * concrete TodoIntegration type.
+ */
+interface TodoCompactionIntegration extends CoreIntegration {
+	setTurnIndex?(turnIndex: number): void;
+	getStaleWarning?(gap?: number): string | null;
+	store?: {
+		getModelItems(): { content: string; status: string }[];
+	};
+}
 
 // ============================================================================
 // AgentSession Class
@@ -344,10 +421,155 @@ export class AgentSession {
 	// Extension system
 	private _extensionRunner!: ExtensionRunner;
 	private _turnIndex = 0;
+	/** Cumulative count of user-initiated prompts in this session (never reset
+	 * per run). Used for staleness heuristics like the todo reminder — one
+	 * user input = one turn, so "stale for N turns" means N inputs from the
+	 * user, not N assistant/tool rounds. Machine-delivered prompts
+	 * (source "extension": monitor results, bg-task completions) do not count. */
+	private _userPromptCount = 0;
+	/** True while the pre-compaction todo refresh turn is running. */
+	private _todoRefreshActive = false;
+	/** Suppress compaction checks while the todo refresh turn is running. */
+	private _suppressCompactionCheck = false;
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
 	private _baseToolDefinitions: Map<string, ToolDefinition> = new Map();
+	private _fileContextTracker = new FileContextTracker();
+	private _fileHistory = new FileChangeHistory();
+
+	/** Pending wait wake-up timer (wait tool), cleared on user input / shutdown. */
+	private _waitTimer: NodeJS.Timeout | undefined;
+	/** Headless wait uses consumed (max 5 per session). */
+	private _headlessWaitCount = 0;
+	/** Wake-up message constants for the wait tool. */
+	private static readonly WAIT_WAKEUP_MESSAGE =
+		"The wait you requested has ended — resume your work where you left off.\n";
+
+	/** Sudo password for local bash (memory only, never persisted). */
+	private _sudoPassword: string | undefined;
+	private readonly _localSudoHandler: LocalSudoHandler = {
+		getPassword: () => this._sudoPassword,
+		setPassword: (password) => {
+			this._sudoPassword = password;
+		},
+		promptPassword: async () => {
+			// The password is asked of the user, masked, kept in memory only,
+			// and never enters the model context. Headless sessions have no UI,
+			// so sudo without a cached password fails with a clear message.
+			return this._extensionUIContext?.input(
+				"sudo password (memory only — never shown, persisted, or sent to the model)",
+				undefined,
+				{ masked: true },
+			);
+		},
+	};
+
+	/** Ask the user a clarifying question (masking NOT used — intent, not secrets). */
+	private readonly _askUserHandler = async (question: string): Promise<AskUserResult> => {
+		if (!this._extensionUIContext) {
+			return { ok: false, reason: "no-ui" };
+		}
+		const answer = await this._extensionUIContext.input(question);
+		if (answer === undefined || answer.trim() === "") {
+			return { ok: false, reason: "cancelled" };
+		}
+		return { ok: true, answer };
+	};
+
+	/** Cancel a pending wait wake-up (user input arrived, session shutting down). */
+	private _cancelPendingWait(): void {
+		if (this._waitTimer) {
+			clearTimeout(this._waitTimer);
+			this._waitTimer = undefined;
+		}
+	}
+
+	/**
+	 * Wait-tool scheduler: enforce caps, arm the wake-up timer, and produce
+	 * the model-facing message. Interactive: up to 12h. Headless (no UI): up
+	 * to 120s, 5 uses per session. With `clamp` (bash gate auto-conversion of
+	 * pure `sleep`), durations above the cap are truncated to it instead of
+	 * rejected.
+	 */
+	private _scheduleWait(seconds: number, opts?: { clamp?: boolean }): WaitScheduleResult {
+		const hasUI = this._extensionUIContext !== undefined;
+		const max = hasUI ? 12 * 3600 : 120;
+		let clamped = false;
+		if (seconds < 1) {
+			return {
+				ok: false,
+				error: `wait duration ${seconds}s is out of range (interactive: 1–${12 * 3600}s; headless: 1–120s).`,
+			};
+		}
+		if (seconds > max) {
+			if (!opts?.clamp) {
+				return {
+					ok: false,
+					error: `wait duration ${seconds}s is out of range (interactive: 1–${12 * 3600}s; headless: 1–120s).`,
+				};
+			}
+			seconds = max;
+			clamped = true;
+		}
+		if (!hasUI) {
+			if (this._headlessWaitCount >= 5) {
+				return {
+					ok: false,
+					error: "Headless wait limit reached: 5 waits per session. Continue without waiting.",
+				};
+			}
+			this._headlessWaitCount++;
+		}
+		this._cancelPendingWait();
+		this._waitTimer = setTimeout(() => {
+			this._waitTimer = undefined;
+			void this._fireWaitWakeup().catch(() => {
+				// Best-effort wake-up: avoid an unhandledRejection if the session is
+				// tearing down mid-delivery.
+			});
+		}, seconds * 1000);
+		const clampNote = clamped ? ` (capped at ${max}s — the wait limit for this session)` : "";
+		return {
+			ok: true,
+			message: `Waiting ${seconds}s${clampNote}. The current turn ends now and resumes automatically when the wait completes — background-task completions wake the agent earlier.`,
+		};
+	}
+
+	/** Deliver the wait wake-up: fixed guidance + running background tasks. */
+	private async _fireWaitWakeup(): Promise<void> {
+		// A completion notification is queued and about to be delivered —
+		// firing the wait wake-up too would wake the model twice.
+		if (this._integrationFollowUpBatcher.pendingCount > 0) return;
+		const bg = this._integrationManager.get<BackgroundTasksIntegration>("bg-tasks");
+		let tasks = "  (no background tasks running)";
+		let stillRunning = false;
+		if (bg) {
+			const running = bg.store.list().filter((t) => t.status === "running");
+			if (running.length > 0) {
+				stillRunning = true;
+				tasks = running
+					.map((t) => {
+						const elapsed = ((Date.now() - t.startTime) / 1000).toFixed(0);
+						const label = t.label ? `: ${t.label}` : "";
+						return `  ◐ ${t.id}${label} (${elapsed}s)`;
+					})
+					.join("\n");
+			}
+		}
+		const guidance = stillRunning
+			? "Tasks still running — you can wait again to rest until they finish."
+			: "Check their outputs and continue; start new background tasks as needed.";
+		// Route like the follow-up batcher: steer while the tool loop is
+		// active so the wake-up lands at the next tool-result checkpoint.
+		const streamingBehavior = this.agent.isActive ? "steer" : "followUp";
+		void this.prompt(`${AgentSession.WAIT_WAKEUP_MESSAGE}\nCurrent background tasks:\n${tasks}\n\n${guidance}`, {
+			streamingBehavior,
+			source: "extension",
+		}).catch(() => {
+			// Wake-up delivery is best-effort (session may be tearing down).
+		});
+	}
 	private _cwd: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
@@ -356,6 +578,29 @@ export class AgentSession {
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _sessionStartEvent: SessionStartEvent;
 	private _extensionUIContext?: ExtensionUIContext;
+	private _integrationManager!: IntegrationManager;
+	/** Unified debounce queue for integration-originated follow-ups. */
+	private readonly _integrationFollowUpBatcher = new IntegrationFollowUpBatcher((text) => {
+		// A follow-up is arriving: the model is about to be woken up, so any
+		// pending wait timer is no longer needed (it would fire a redundant
+		// wake-up later).
+		this._cancelPendingWait();
+		// Model's tool loop actually active: steer so the notification lands
+		// at the next tool-result checkpoint instead of waiting for the whole
+		// turn to finish (the model may otherwise notice the completion
+		// itself first and the notification arrives late, as a redundant
+		// follow-up). Loop idle: followUp starts a new turn as before. The
+		// distinction matters during post-run processing (compaction/retry):
+		// the session flag is still set there but the loop is gone, so
+		// queueing would strand the message until the next user input.
+		const streamingBehavior = this.agent.isActive ? "steer" : "followUp";
+		void this.prompt(text, { streamingBehavior, source: "extension" }).catch((err) => {
+			// Follow-up delivery is best-effort (session may be tearing down), but
+			// a genuine failure must not vanish without a trace — a lost follow-up
+			// means a lost task-completion report.
+			console.error("Integration follow-up delivery failed:", err);
+		});
+	});
 	private _extensionMode: ExtensionMode = "print";
 	private _extensionCommandContextActions?: ExtensionCommandContextActions;
 	private _extensionAbortHandler?: () => void;
@@ -379,11 +624,20 @@ export class AgentSession {
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.sessionManager = config.sessionManager;
+		this._fileHistory.getLeafId = () => this.sessionManager.getLeafId();
 		this.settingsManager = config.settingsManager;
+		// fork(pi-ex): publish the streamFn/settingsManager bridge for fork extensions.
+		registerForkHost(this.sessionManager, {
+			streamFn: this.agent.streamFunction,
+			settingsManager: this.settingsManager,
+		});
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
+		// Load the project path set for idle file-state rotation (git ls-files).
+		// Non-git directories simply skip the project-wide phase.
+		void this._loadProjectPaths();
 		this._modelRuntime = config.modelRuntime;
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
@@ -480,6 +734,10 @@ export class AgentSession {
 	 */
 	private _installAgentToolHooks(): void {
 		this.agent.beforeToolCall = async ({ toolCall, args }) => {
+			const integrationBlock = this._integrationManager?.onToolCall(toolCall.name, args as Record<string, unknown>);
+			if (integrationBlock) {
+				return integrationBlock;
+			}
 			const runner = this._extensionRunner;
 			if (!runner.hasHandlers("tool_call")) {
 				return undefined;
@@ -564,7 +822,13 @@ export class AgentSession {
 	/** Emit an event to all listeners */
 	private _emit(event: AgentSessionEvent): void {
 		for (const l of this._eventListeners) {
-			l(event);
+			try {
+				l(event);
+			} catch (err) {
+				// Isolate listener failures so one broken UI listener cannot abort an
+				// entire agent run (mirrors core/event-bus.ts safeHandler style).
+				console.error(`Agent session event handler error (${event.type}):`, err);
+			}
 		}
 	}
 
@@ -609,10 +873,41 @@ export class AgentSession {
 		} finally {
 			this._resolveIdleWaitIfIdle();
 		}
+		// Replay any queued follow-up/steering messages that were enqueued
+		// while the loop was winding down but never consumed (post-run
+		// compaction/retry windows). Without this, a background-task
+		// completion arriving during those windows would strand in the queue
+		// until the next user input.
+		this._replayStrandedQueuedMessages();
+	}
+
+	/**
+	 * Drain session-visible queue mirrors that the agent loop never consumed
+	 * (it had already exited when the messages were enqueued) and deliver
+	 * them through the normal prompt path.
+	 */
+	private _replayStrandedQueuedMessages(): void {
+		const stranded = [...this._steeringMessages, ...this._followUpMessages];
+		if (stranded.length === 0) {
+			return;
+		}
+		this._steeringMessages = [];
+		this._followUpMessages = [];
+		this._emitQueueUpdate();
+		const text = stranded.join("\n\n---\n\n");
+		void this.prompt(text, { streamingBehavior: "followUp", source: "extension" }).catch(() => {
+			// Replay is best-effort (session may be tearing down).
+		});
 	}
 
 	// Track last assistant message for auto-compaction check
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;
+	private _uncertaintyStore: UncertaintyStore | undefined = undefined;
+	private _autoReviewInFlight = false;
+	private _conflictCheckInFlight = false;
+	private _overrideConfirmation: { proposal: UserOverrideProposal; resolve: (accepted: boolean) => void } | undefined =
+		undefined;
+	private _overrideConfirmationTimer: ReturnType<typeof setTimeout> | undefined = undefined;
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
@@ -633,6 +928,10 @@ export class AgentSession {
 					if (followUpIndex !== -1) {
 						this._followUpMessages.splice(followUpIndex, 1);
 						this._emitQueueUpdate();
+					} else {
+						// Genuine user input: silently check whether it conflicts with
+						// any pending uncertainty flag (runs before the model responds).
+						this._detectIntentConflict(messageText);
 					}
 				}
 			}
@@ -643,6 +942,13 @@ export class AgentSession {
 
 		// Notify all listeners
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
+
+		if (event.type === "agent_end") {
+			this._integrationManager?.onAgentEnd();
+			// The agent is idle until the next user input — rotate the file-state
+			// checks now (stops again on the next prompt).
+			this._fileContextTracker.startRotation();
+		}
 
 		// Handle session persistence
 		if (event.type === "message_end") {
@@ -661,7 +967,24 @@ export class AgentSession {
 				event.message.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
+				const entryId = this.sessionManager.appendMessage(event.message);
+
+				// Incremental uncertainty review: scan assistant text for
+				// [uncertain:...] markers and queue them for the run-end prompt.
+				if (event.message.role === "assistant") {
+					this.uncertaintyStore.scanAssistantText(contentText(event.message.content, ""), entryId);
+				}
+
+				// Stale detection: a successful edit/write invalidates decisions
+				// whose subject file just changed.
+				if (
+					event.message.role === "toolResult" &&
+					!event.message.isError &&
+					(event.message.toolName === "edit" || event.message.toolName === "write")
+				) {
+					const modifiedPath = this._findToolCallPath(event.message.toolCallId);
+					if (modifiedPath) this.uncertaintyStore.markPathModified(modifiedPath);
+				}
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
@@ -687,6 +1010,320 @@ export class AgentSession {
 			}
 		}
 	};
+
+	/** Incremental uncertainty review: pending flags + user decisions for this session. */
+	get uncertaintyStore(): UncertaintyStore {
+		if (!this._uncertaintyStore) {
+			this._uncertaintyStore = new UncertaintyStore(this.sessionManager);
+		}
+		return this._uncertaintyStore;
+	}
+
+	/**
+	 * Silent intent-conflict detection: the user's latest message may
+	 * contradict, supersede, or render irrelevant a pending or already-
+	 * decided uncertainty entry. Runs before the model responds
+	 * (fire-and-forget, never blocks or throws); a detected conflict
+	 * triggers the auto-review pass over the affected entries.
+	 */
+	private _detectIntentConflict(userText: string): void {
+		if (!this.settingsManager.getUncertaintyReviewAuto()) return;
+		if (this._conflictCheckInFlight || this._autoReviewInFlight) return;
+		const model = this.model;
+		if (!model) return;
+		const store = this.uncertaintyStore;
+		const entries = this._allUncertaintyEntries(store);
+		if (entries.length === 0) return;
+		this._conflictCheckInFlight = true;
+		void (async () => {
+			try {
+				const auth = await this._getSummarizationRequestAuth(model);
+				const prompt = this._conflictPrompt(userText, entries);
+				const message = await completeSummarization(
+					model,
+					{
+						messages: [
+							{
+								role: "user" as const,
+								content: [{ type: "text" as const, text: prompt }],
+								timestamp: Date.now(),
+							},
+						],
+					},
+					{
+						maxTokens: 200,
+						apiKey: auth.apiKey,
+						headers: auth.headers,
+						env: auth.env,
+						signal: AbortSignal.timeout(10_000),
+					},
+					this.agent.streamFunction,
+					this.settingsManager.getRetrySettings(),
+				);
+				const ids = parseConflictIds(contentText(message.content, ""));
+				if (ids.length > 0) {
+					await this._runAutoReviewIfEnabled(ids);
+				}
+			} catch {
+				// Silent: detection must never affect the conversation.
+			} finally {
+				this._conflictCheckInFlight = false;
+			}
+		})();
+	}
+
+	/** Pending flags + latest decision per flag, for conflict detection. */
+	private _allUncertaintyEntries(store: UncertaintyStore): Array<{ id: string; claim: string }> {
+		const entries = new Map<string, { id: string; claim: string }>();
+		for (const flag of store.pending()) entries.set(flag.id, { id: flag.id, claim: flag.claim });
+		for (const decision of store.decisions()) {
+			if (!entries.has(decision.flagId))
+				entries.set(decision.flagId, { id: decision.flagId, claim: decision.claim });
+		}
+		return [...entries.values()];
+	}
+
+	/**
+	 * Auto-review pass: the model re-settles candidates newest-first
+	 * against the current conversation. Pending flags are decided
+	 * directly; model rulings may be overturned directly; user rulings
+	 * are only changed after a confirmation popup (300s budget, silent
+	 * reject on timeout/no UI). Runs at compaction and after an intent
+	 * conflict.
+	 */
+	private async _runAutoReviewIfEnabled(conflictIds?: string[]): Promise<void> {
+		if (!this.settingsManager.getUncertaintyReviewAuto()) return;
+		const model = this.model;
+		if (!model) return;
+		const store = this.uncertaintyStore;
+		if (this._autoReviewInFlight) return;
+		if (this._reviewCandidates(store, conflictIds).length === 0) return;
+		this._autoReviewInFlight = true;
+		try {
+			const auth = await this._getSummarizationRequestAuth(model);
+			// Layer 1 (compaction only): content-level dedup — drop duplicate
+			// and contradicting flags (newest wins), before any context
+			// review, so redundancy never reaches the verdict pass.
+			if (!conflictIds) {
+				await runContentDedup(store, {
+					model,
+					streamFn: this.agent.streamFunction,
+					retry: this.settingsManager.getRetrySettings(),
+					apiKey: auth.apiKey,
+					headers: auth.headers,
+					env: auth.env,
+					signal: AbortSignal.timeout(120_000),
+					onUserOverrideProposal: (proposal) => this._confirmUserRulingOverride(proposal),
+				});
+			}
+			// Layer 2: context review of the surviving pending flags.
+			const candidates = this._reviewCandidates(store, conflictIds);
+			if (candidates.length === 0) return;
+			await runAutoReview(store, {
+				model,
+				streamFn: this.agent.streamFunction,
+				retry: this.settingsManager.getRetrySettings(),
+				apiKey: auth.apiKey,
+				headers: auth.headers,
+				env: auth.env,
+				contextText: this._recentConversationText(),
+				signal: AbortSignal.timeout(120_000),
+				candidates,
+				onUserOverrideProposal: (proposal) => this._confirmUserRulingOverride(proposal),
+			});
+		} catch {
+			// Silent: a failed review must never break compaction or the turn.
+		} finally {
+			this._autoReviewInFlight = false;
+		}
+	}
+
+	/**
+	 * Auto-review the uncertain sections of a compaction summary in one
+	 * batched model call; settled entries are marked in the returned text.
+	 * Never throws — failures return the summary unchanged.
+	 */
+	private async _autoReviewSummary(summary: string): Promise<string> {
+		const model = this.model;
+		if (!model) return summary;
+		try {
+			const auth = await this._getSummarizationRequestAuth(model);
+			return await autoReviewSummaryItems(summary, {
+				model,
+				streamFn: this.agent.streamFunction,
+				retry: this.settingsManager.getRetrySettings(),
+				apiKey: auth.apiKey,
+				headers: auth.headers,
+				env: auth.env,
+				contextText: this._recentConversationText(),
+				signal: AbortSignal.timeout(120_000),
+			});
+		} catch {
+			return summary;
+		}
+	}
+
+	/** Recent user/assistant messages as plain text (newest last), for review prompts. */
+	private _recentConversationText(maxMessages = 20): string {
+		const messages = this.agent.state.messages;
+		const parts: string[] = [];
+		for (const message of messages.slice(-maxMessages)) {
+			if (message.role !== "user" && message.role !== "assistant") continue;
+			const text = contentText(message.content, "").trim();
+			if (!text) continue;
+			parts.push(`${message.role}: ${text.slice(0, 600)}`);
+		}
+		return parts.join("\n");
+	}
+
+	private _conflictPrompt(userText: string, entries: Array<{ id: string; claim: string }>): string {
+		const list = entries
+			.slice(0, 10)
+			.map((f) => `- [${f.id}] ${f.claim}`)
+			.join("\n");
+		return [
+			"The user just said:",
+			`<user>${userText.slice(0, 1000)}</user>`,
+			"",
+			"The session has these uncertainty entries (pending and already reviewed):",
+			list,
+			"",
+			"Reply with ONLY a JSON array of flag ids whose statement is contradicted,",
+			"superseded, or rendered irrelevant by the user's latest message.",
+			"If none apply, reply []",
+		].join("\n");
+	}
+
+	/**
+	 * Review candidates, newest first. Without conflict ids: all pending
+	 * flags (compaction trigger). With conflict ids: those entries plus
+	 * any still-pending flags — already-decided entries are only
+	 * re-examined when the latest context actually touches them.
+	 */
+	private _reviewCandidates(store: UncertaintyStore, conflictIds?: string[]): AutoReviewCandidate[] {
+		const wanted = conflictIds ? new Set(conflictIds) : undefined;
+		const byId = new Map<string, AutoReviewCandidate>();
+		// Decided flags are only re-examined when the latest context
+		// actually touches them (conflict check). Compaction alone must not
+		// re-review the whole decision history on every run.
+		if (wanted) {
+			const decided = store.decisions();
+			// Newest first: decisions are appended chronologically, so walk
+			// them backwards.
+			for (let i = decided.length - 1; i >= 0; i--) {
+				const d = decided[i]!;
+				if (!wanted.has(d.flagId)) continue;
+				if (byId.has(d.flagId)) continue;
+				byId.set(d.flagId, {
+					id: d.flagId,
+					type: d.type,
+					claim: d.claim,
+					subject: d.subject,
+				});
+			}
+		}
+		const pending = store.pending();
+		// Pending flags sit at the tail of their arrival order (newest
+		// last), so walk backwards. Cap the batch at 100 newest — a
+		// backlog beyond that stays manual rather than stalling compaction.
+		for (let i = pending.length - 1; i >= 0 && byId.size < 100; i--) {
+			const f = pending[i]!;
+			if (wanted && !wanted.has(f.id)) continue;
+			if (byId.has(f.id)) continue;
+			byId.set(f.id, { id: f.id, type: f.type, claim: f.claim, subject: f.subject });
+		}
+		return [...byId.values()];
+	}
+
+	/**
+	 * Ask the user before overturning one of their rulings. Emits an event
+	 * the UI listens for; resolves true on confirmation. 300s budget — a
+	 * timeout (or no UI attached) silently keeps the user ruling.
+	 */
+	private async _confirmUserRulingOverride(proposal: UserOverrideProposal): Promise<boolean> {
+		if (this._overrideConfirmation) {
+			return false; // one confirmation at a time
+		}
+		return new Promise<boolean>((resolve) => {
+			const timer = setTimeout(() => {
+				this._overrideConfirmationTimer = undefined;
+				this._overrideConfirmation = undefined;
+				resolve(false);
+			}, 300_000);
+			this._overrideConfirmationTimer = timer;
+			this._overrideConfirmation = {
+				proposal,
+				resolve: (accepted) => {
+					this._overrideConfirmationTimer = undefined;
+					clearTimeout(timer);
+					this._overrideConfirmation = undefined;
+					resolve(accepted);
+				},
+			};
+			this._emit({ type: "uncertainty_override_request", proposal });
+		});
+	}
+
+	/** UI response to an outstanding override confirmation. */
+	respondOverrideConfirmation(accepted: boolean): boolean {
+		const pending = this._overrideConfirmation;
+		if (!pending) return false;
+		pending.resolve(accepted);
+		return true;
+	}
+
+	/** Look up the path argument of a file tool call by its toolCallId. */
+	private _findToolCallPath(toolCallId: string): string | undefined {
+		for (let i = this.agent.state.messages.length - 1; i >= 0; i--) {
+			const msg = this.agent.state.messages[i];
+			if (msg.role !== "assistant") continue;
+			for (const block of (msg as AssistantMessage).content) {
+				if (block.type === "toolCall" && block.id === toolCallId) {
+					const args = block.arguments as { path?: unknown } | undefined;
+					return typeof args?.path === "string" ? args.path : undefined;
+				}
+			}
+		}
+		return undefined;
+	}
+
+	/**
+	 * Wrap the edit tool so successful edits are followed by a reference scan:
+	 * identifiers removed/changed by the edit are looked up via the codegraph
+	 * CLI (read-only; the daemon keeps the index fresh) and the remaining call
+	 * sites are appended to the result. Best-effort — a missing/slow/failing
+	 * scan never breaks the edit result.
+	 */
+	private _wrapWithPostEditScan(tool: AgentTool): AgentTool {
+		return {
+			...tool,
+			execute: async (toolCallId, params, signal, onUpdate) => {
+				const result = await tool.execute(toolCallId, params, signal, onUpdate);
+				if (result && this.settingsManager.getCodeScanEnabled()) {
+					const edits = (params as { edits?: Array<{ oldText?: string; newText?: string }> } | undefined)?.edits;
+					if (Array.isArray(edits) && edits.length > 0) {
+						const changed = extractChangedIdentifiers(edits);
+						if (changed.length > 0) {
+							try {
+								const scan = await runPostEditScan(changed, {
+									cwd: this._cwd,
+								});
+								if (scan) {
+									return {
+										...result,
+										content: [...(result.content ?? []), { type: "text", text: scan }],
+									};
+								}
+							} catch {
+								// The scan must never break the edit result.
+							}
+						}
+					}
+				}
+				return result;
+			},
+		};
+	}
 
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
 		const settings = this.settingsManager.getRetrySettings();
@@ -855,6 +1492,20 @@ export class AgentSession {
 			// Dispose must succeed even if an abort hook throws.
 		}
 
+		this._integrationFollowUpBatcher.dispose();
+
+		this._cancelPendingWait();
+
+		// Release any pending uncertainty-override confirmation timer so it cannot
+		// fire callbacks against a disposed session.
+		if (this._overrideConfirmationTimer !== undefined) {
+			clearTimeout(this._overrideConfirmationTimer);
+			this._overrideConfirmationTimer = undefined;
+			this._overrideConfirmation = undefined;
+		}
+
+		this._integrationManager?.onShutdown();
+
 		this._extensionRunner.invalidate(
 			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
 		);
@@ -925,6 +1576,11 @@ export class AgentSession {
 
 	getToolDefinition(name: string): ToolDefinition | undefined {
 		return this._toolDefinitions.get(name)?.definition;
+	}
+
+	/** Access a core integration (e.g. "todo") by id. */
+	getIntegration<T extends CoreIntegration = CoreIntegration>(id: string): T | undefined {
+		return this._integrationManager?.get<T>(id);
 	}
 
 	/**
@@ -1061,7 +1717,14 @@ export class AgentSession {
 			toolSnippets,
 			promptGuidelines,
 		};
-		return buildSystemPrompt(this._baseSystemPromptOptions);
+		const prompt = buildSystemPrompt(this._baseSystemPromptOptions);
+		// Teach the model the [uncertain:...] marker protocol when incremental
+		// review is active (interactive runs collect and prompt on the flags).
+		const guidance: string[] = [WORK_LOOP_GUIDANCE];
+		if (this.settingsManager.getUncertaintyReviewTiming() === "incremental") {
+			guidance.push(UNCERTAINTY_PROTOCOL_PROMPT);
+		}
+		return `${prompt}\n\n${guidance.join("\n\n")}`;
 	}
 
 	// =========================================================================
@@ -1072,7 +1735,15 @@ export class AgentSession {
 		this._isAgentRunActive = true;
 		try {
 			await this.agent.prompt(messages);
+			let continuations = 0;
 			while (await this._handlePostAgentRun()) {
+				if (continuations >= MAX_AGENT_RUN_CONTINUATIONS) {
+					console.error(
+						`agent-session: exceeded ${MAX_AGENT_RUN_CONTINUATIONS} post-run continuations; stopping agent run`,
+					);
+					break;
+				}
+				continuations++;
 				await this.agent.continue();
 			}
 		} finally {
@@ -1122,6 +1793,12 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		// A new input arrives — stop the idle file-state rotation promptly.
+		this._fileContextTracker.stopRotation();
+		// A non-extension input means the user is back: cancel any pending wait.
+		if (options?.source !== "extension") {
+			this._cancelPendingWait();
+		}
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		let messages: AgentMessage[] | undefined;
@@ -1171,8 +1848,11 @@ export class AgentSession {
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 			}
 
-			// If streaming, queue via steer() or followUp() based on option
-			if (this.isStreaming) {
+			// If the tool loop is active, queue via steer() or followUp() based on option.
+			// (Checked against agent.isActive, not the session flag: during post-run
+			// processing the session flag is still set while the loop is gone, and
+			// queueing there would strand the message until the next user input.)
+			if (this.agent.isActive) {
 				if (!options?.streamingBehavior) {
 					throw new Error(
 						"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
@@ -1277,7 +1957,142 @@ export class AgentSession {
 		}
 
 		preflightResult?.(true);
+		this._maybeWarnStaleTodos(options?.source);
+		this._maybeWarnStaleFiles();
 		await this._runAgentPrompt(messages);
+	}
+
+	/** Inject a delta notice for files the model has seen that changed on disk. */
+	private _maybeWarnStaleFiles(): void {
+		try {
+			const notices = this._fileContextTracker.staleNotices();
+			if (notices.length === 0) return;
+			const lines = notices
+				.map((notice) => `- ${relativePath(this._cwd, notice.path)} (changed ${formatFileTime(notice.detectedAt)})`)
+				.join("\n");
+			const warning =
+				`[file-state] ${notices.length === 1 ? "1 file you have seen" : `${notices.length} files you have seen`} changed on disk since your last read:\n` +
+				`${lines}\n` +
+				`Re-read them before relying on their contents (they may differ from what you remember).`;
+			this._steeringMessages.push(warning);
+			this._emitQueueUpdate();
+			this.agent.steer({
+				role: "user",
+				content: [{ type: "text", text: warning }],
+				timestamp: Date.now(),
+			});
+			this._fileContextTracker.markNotified(notices.map((notice) => notice.path));
+		} catch {
+			/* non-critical */
+		}
+	}
+
+	/**
+	 * Load the project file list (git ls-files) for rotation. Failures degrade
+	 * silently — rotation then only covers files the model has touched.
+	 */
+	private async _loadProjectPaths(): Promise<void> {
+		try {
+			const { stdout } = await execFileAsync("git", ["ls-files", "-z"], {
+				cwd: this._cwd,
+				maxBuffer: 32 * 1024 * 1024,
+			});
+			const paths = stdout
+				.split("\0")
+				.filter(Boolean)
+				.map((p) => joinPath(this._cwd, p));
+			this._fileContextTracker.noteProjectPaths(paths);
+		} catch {
+			/* not a git repo — project-wide rotation unavailable */
+		}
+	}
+
+	/**
+	 * If the todo list has unfinished model-owned items, run one extra model
+	 * turn asking it to refresh the todo (mark completed items, keep the rest)
+	 * BEFORE compaction. The refresh turn's messages land inside the compaction
+	 * window, so the freshest todo state is captured by the summary.
+	 *
+	 * Manual and auto compaction both call this right before
+	 * prepareCompaction(). Never throws — a failed refresh degrades to plain
+	 * compaction. Nested calls (the refresh reply triggering an auto-compact
+	 * check) are guarded by {@link _todoRefreshActive}, and the refresh reply
+	 * itself is excluded from compaction checks via {@link _suppressCompactionCheck}.
+	 */
+	private async _updateTodoBeforeCompaction(): Promise<void> {
+		if (this._todoRefreshActive) return;
+		const todo = this.getIntegration<TodoCompactionIntegration>("todo");
+		const items = todo?.store?.getModelItems();
+		if (!items || items.length === 0 || !items.some((i) => i.status !== "completed")) {
+			return;
+		}
+
+		// The refresh turn is a full-context request. Without an output cap it
+		// reserves the remaining window as maxTokens (window − estimate − 4096),
+		// i.e. the request occupies ~99.5% of the window at 70% usage — any
+		// tokenizer-vs-estimate error then surfaces as a context-overflow error
+		// right after compaction starts. Cap the output (the refresh only
+		// rewrites the todo list) and skip the refresh when even that would not
+		// fit; overflow compaction still recovers without it.
+		const model = this.model;
+		if (model && model.contextWindow > 0) {
+			const estimatedTokens =
+				estimateContextTokens(this.agent.state.messages).tokens + estimateTextTokens(TODO_COMPACTION_REMINDER);
+			if (estimatedTokens + TODO_REFRESH_MAX_TOKENS + 4096 > model.contextWindow) {
+				console.error(
+					"Skipping pre-compaction todo refresh: the request would not fit the model's context window.",
+				);
+				return;
+			}
+		}
+
+		this._todoRefreshActive = true;
+		this._suppressCompactionCheck = true;
+		const originalStreamFn = this.agent.streamFunction;
+		this.agent.streamFunction = (m, ctx, options) =>
+			originalStreamFn(m, ctx, { ...options, maxTokens: TODO_REFRESH_MAX_TOKENS });
+		try {
+			await this._runAgentPrompt([
+				{
+					role: "user",
+					content: [{ type: "text", text: TODO_COMPACTION_REMINDER }],
+					timestamp: Date.now(),
+				},
+			]);
+		} catch (err) {
+			console.error("Todo refresh before compaction failed (continuing with compaction):", err);
+		} finally {
+			this.agent.streamFunction = originalStreamFn;
+			this._suppressCompactionCheck = false;
+			this._todoRefreshActive = false;
+		}
+	}
+
+	/** Check for stale todo items and inject a steering reminder. */
+	private _maybeWarnStaleTodos(source?: InputSource): void {
+		try {
+			const todo = this.getIntegration<TodoCompactionIntegration>("todo");
+			if (!todo?.setTurnIndex || !todo?.getStaleWarning) return;
+			// Count user-initiated prompts only; machine follow-ups are not
+			// user input and must not advance the staleness clock.
+			if (source !== "extension") this._userPromptCount++;
+			todo.setTurnIndex(this._userPromptCount);
+			const warning = todo.getStaleWarning();
+			if (warning) {
+				// Mirror into the UI queue AND actually deliver to the agent.
+				// Without agent.steer() the message sat in the steering queue
+				// forever — visible but never sent.
+				this._steeringMessages.push(warning);
+				this._emitQueueUpdate();
+				this.agent.steer({
+					role: "user",
+					content: [{ type: "text", text: warning }],
+					timestamp: Date.now(),
+				});
+			}
+		} catch {
+			/* non-critical */
+		}
 	}
 
 	/**
@@ -1519,16 +2334,20 @@ export class AgentSession {
 	}
 
 	/**
-	 * Clear all queued messages and return them.
+	 * Clear one queue or both queues and return the messages that were removed.
 	 * Useful for restoring to editor when user aborts.
-	 * @returns Object with steering and followUp arrays
 	 */
-	clearQueue(): { steering: string[]; followUp: string[] } {
-		const steering = [...this._steeringMessages];
-		const followUp = [...this._followUpMessages];
-		this._steeringMessages = [];
-		this._followUpMessages = [];
-		this.agent.clearAllQueues();
+	clearQueue(queue?: "steer" | "follow_up"): { steering: string[]; followUp: string[] } {
+		const steering = queue === "follow_up" ? [] : [...this._steeringMessages];
+		const followUp = queue === "steer" ? [] : [...this._followUpMessages];
+		if (queue !== "follow_up") {
+			this._steeringMessages = [];
+			this.agent.clearSteeringQueue();
+		}
+		if (queue !== "steer") {
+			this._followUpMessages = [];
+			this.agent.clearFollowUpQueue();
+		}
 		this._emitQueueUpdate();
 		return { steering, followUp };
 	}
@@ -1786,36 +2605,101 @@ export class AgentSession {
 		this.settingsManager.setFollowUpMode(mode);
 	}
 
+	/** Latest structured checkpoint data from the current branch, if any. */
+	private _previousCheckpoint(): { contract?: TaskContract; ledger?: ActionLedger } {
+		const prev = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const details = prev?.details as CompactionDetails | undefined;
+		return { contract: details?.contract, ledger: details?.ledger };
+	}
+
+	/**
+	 * Generate a compaction result honoring compaction.quality.
+	 * "structured" runs the checkpoint pipeline (contract + ledger + verifier);
+	 * any failure falls back to the standard narrative summary.
+	 */
+	private async _generateCompaction(
+		preparation: CompactionPreparation,
+		options: {
+			model: Model<any>;
+			customInstructions?: string;
+			signal: AbortSignal;
+			apiKey?: string;
+			headers?: Record<string, string>;
+			env?: Record<string, string>;
+			forceStandard?: boolean;
+			callbacks?: RetryCallbacks;
+		},
+	): Promise<CompactionResult> {
+		if (this.settingsManager.getCompactionQuality() === "structured" && !options.forceStandard && this.model) {
+			try {
+				const keptMessages: AgentMessage[] = [];
+				const branch = this.sessionManager.getBranch();
+				const keptIdx = branch.findIndex((e) => e.id === preparation.firstKeptEntryId);
+				if (keptIdx >= 0) {
+					for (let i = keptIdx; i < branch.length; i++) {
+						keptMessages.push(...sessionEntryToContextMessages(branch[i]));
+					}
+				}
+				// Refresh the L1 contact tracker right before the checkpoint so the
+				// World State section reflects the freshest file state (external
+				// changes made during the session land in L2).
+				await this._fileContextTracker.refreshContacts();
+				const fileContext = this._fileContextTracker.snapshot();
+				const result = await compactStructured(
+					preparation,
+					this._previousCheckpoint(),
+					options.model,
+					options.customInstructions,
+					{
+						apiKey: options.apiKey,
+						headers: options.headers,
+						env: options.env,
+						signal: options.signal,
+						thinkingLevel: this.thinkingLevel,
+						streamFn: this.agent.streamFunction,
+						retry: this.settingsManager.getRetrySettings(),
+					},
+					keptMessages,
+					{
+						verifyPassText: this.uncertaintyStore.formatForVerifyPass(),
+						verifiedLines: this.uncertaintyStore.verifiedSectionLines(),
+					},
+					fileContext,
+				);
+				return {
+					summary: result.summary,
+					firstKeptEntryId: preparation.firstKeptEntryId,
+					tokensBefore: preparation.tokensBefore,
+					usage: result.usage,
+					details: {
+						...computeFileLists(preparation.fileOps),
+						contract: result.contract,
+						ledger: result.ledger,
+						version: 2,
+					} satisfies CompactionDetails,
+				};
+			} catch (err) {
+				console.error("Structured checkpoint failed, falling back to standard compaction:", err);
+			}
+		}
+		return compact(
+			preparation,
+			options.model,
+			options.apiKey,
+			options.headers,
+			options.customInstructions,
+			options.signal,
+			this.thinkingLevel,
+			this.agent.streamFunction,
+			options.env,
+			this.settingsManager.getRetrySettings(),
+			options.callbacks,
+		);
+	}
+
 	// =========================================================================
 	// Compaction
 	// =========================================================================
-
-	/** Generate Pi's built-in compaction summary for manual and automatic compaction. */
-	private async _runDefaultCompaction(
-		preparation: CompactionPreparation,
-		requestModel: Model<any>,
-		apiKey: string | undefined,
-		headers: Record<string, string> | undefined,
-		customInstructions: string | undefined,
-		signal: AbortSignal,
-		env: Record<string, string> | undefined,
-		reason: "manual" | "threshold" | "overflow",
-	): Promise<CompactionResult> {
-		return compact(
-			preparation,
-			requestModel,
-			apiKey,
-			headers,
-			customInstructions,
-			signal,
-			this.thinkingLevel,
-			this.agent.streamFunction,
-			env,
-			this.settingsManager.getRetrySettings(),
-			this._summarizationRetryCallbacks({ source: "compaction", reason }),
-			undefined, // sessionId
-		);
-	}
 
 	/**
 	 * Manually compact the session context.
@@ -1834,6 +2718,19 @@ export class AgentSession {
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
 		await this.abort();
+		if (this.isCompacting) {
+			// An auto compaction / branch summary may be mid-flight: cancel it and
+			// wait briefly for its cleanup, so two compactions never interleave.
+			this.abortCompaction();
+			this.abortBranchSummary();
+			const deadline = Date.now() + 10_000;
+			while (this.isCompacting && Date.now() < deadline) {
+				await new Promise((resolve) => setTimeout(resolve, 50));
+			}
+			if (this.isCompacting) {
+				throw new Error("Compaction already in progress");
+			}
+		}
 		this._compactionAbortController = new AbortController();
 		this._emit({ type: "compaction_start", reason: "manual" });
 		let fromExtension = false;
@@ -1844,6 +2741,10 @@ export class AgentSession {
 			}
 
 			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
+
+			// Refresh the todo (one model turn) before the compaction window is
+			// fixed, so the updated todo state is summarized, not lost.
+			await this._updateTodoBeforeCompaction();
 
 			const pathEntries = this.sessionManager.getBranch();
 			const settings = this.settingsManager.getCompactionSettings();
@@ -1881,6 +2782,11 @@ export class AgentSession {
 				}
 			}
 
+			// Auto-review: settle pending flags against the current context
+			// before summarizing, so the verify pass includes the rulings.
+			// Same path as auto compaction. Silent — a failure never blocks.
+			await this._runAutoReviewIfEnabled();
+
 			let summary: string;
 			let firstKeptEntryId: string;
 			let tokensBefore: number;
@@ -1895,17 +2801,16 @@ export class AgentSession {
 				usage = extensionCompaction.usage;
 				details = extensionCompaction.details;
 			} else {
-				// Shared default summary generator, also used by automatic compaction.
-				const result = await this._runDefaultCompaction(
-					preparation,
-					requestModel,
+				// Generate compaction result
+				const result = await this._generateCompaction(preparation, {
+					model: requestModel,
+					customInstructions,
+					signal: this._compactionAbortController.signal,
 					apiKey,
 					headers,
-					customInstructions,
-					this._compactionAbortController.signal,
 					env,
-					"manual",
-				);
+					callbacks: this._summarizationRetryCallbacks({ source: "compaction", reason: "manual" }),
+				});
 				summary = result.summary;
 				firstKeptEntryId = result.firstKeptEntryId;
 				tokensBefore = result.tokensBefore;
@@ -1917,7 +2822,21 @@ export class AgentSession {
 				throw new Error("Compaction cancelled");
 			}
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+			// Auto-review the summary's uncertain sections before it becomes
+			// permanent context (same path as auto compaction). Silent — a
+			// failure keeps the summary untouched and the user review intact.
+			if (this.settingsManager.getUncertaintyReviewAuto()) {
+				summary = await this._autoReviewSummary(summary);
+			}
+
+			const compactionEntryId = this.sessionManager.appendCompaction(
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				fromExtension,
+				usage,
+			);
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
@@ -1943,6 +2862,7 @@ export class AgentSession {
 				firstKeptEntryId,
 				tokensBefore,
 				estimatedTokensAfter,
+				compactionEntryId,
 				usage,
 				details,
 			};
@@ -2021,6 +2941,10 @@ export class AgentSession {
 	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return false;
+
+		// While the pre-compaction todo refresh turn is running, its reply must
+		// not itself trigger compaction — the caller is already compacting.
+		if (this._suppressCompactionCheck) return false;
 
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
 		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return false;
@@ -2132,6 +3056,8 @@ export class AgentSession {
 	 * @returns Whether the post-run loop should call `agent.continue()`
 	 */
 	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+		// Never run alongside a manual compaction or branch summarization.
+		if (this.isCompacting) return false;
 		const settings = this.settingsManager.getCompactionSettings();
 		let started = false;
 		let fromExtension = false;
@@ -2143,6 +3069,34 @@ export class AgentSession {
 
 			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
 
+			// Enter the compaction state BEFORE the refresh turn so a concurrent
+			// manual compact() sees isCompacting and aborts/wait-for-cleanup
+			// instead of leaving two compactions to interleave.
+			this._autoCompactionAbortController = new AbortController();
+			const autoController = this._autoCompactionAbortController;
+
+			// Overflow already exceeds the model window: skip the refresh turn —
+			// its reply would likely overflow/truncate again, wasting an expensive
+			// call and letting an error/length message pollute the upcoming summary
+			// window. Threshold and manual compaction keep the refresh.
+			if (reason !== "overflow") {
+				await this._updateTodoBeforeCompaction();
+			}
+
+			// Re-check after the (possibly long, awaited) refresh turn: a concurrent
+			// manual compact() aborted our controller and is waiting for cleanup.
+			// Back off, emitting an aborted end with no compaction entry.
+			if (autoController.signal.aborted) {
+				this._emit({
+					type: "compaction_end",
+					reason,
+					result: undefined,
+					aborted: true,
+					willRetry: false,
+				});
+				return false;
+			}
+
 			const pathEntries = this.sessionManager.getBranch();
 
 			const preparation = prepareCompaction(pathEntries, settings);
@@ -2151,7 +3105,6 @@ export class AgentSession {
 			}
 
 			this._emit({ type: "compaction_start", reason });
-			this._autoCompactionAbortController = new AbortController();
 			started = true;
 
 			let extensionCompaction: CompactionResult | undefined;
@@ -2190,6 +3143,11 @@ export class AgentSession {
 				}
 			}
 
+			// Auto-review: settle pending flags against the current context
+			// before summarizing, so the verify pass includes the rulings.
+			// Silent — a failure never blocks compaction.
+			await this._runAutoReviewIfEnabled();
+
 			let summary: string;
 			let firstKeptEntryId: string;
 			let tokensBefore: number;
@@ -2204,17 +3162,16 @@ export class AgentSession {
 				usage = extensionCompaction.usage;
 				details = extensionCompaction.details;
 			} else {
-				// Shared default summary generator, also used by manual compaction.
-				const compactResult = await this._runDefaultCompaction(
-					preparation,
-					requestModel,
+				// Generate compaction result
+				const compactResult = await this._generateCompaction(preparation, {
+					model: requestModel,
+					signal: this._autoCompactionAbortController.signal,
 					apiKey,
 					headers,
-					undefined,
-					this._autoCompactionAbortController.signal,
 					env,
-					reason,
-				);
+					forceStandard: reason === "overflow",
+					callbacks: this._summarizationRetryCallbacks({ source: "compaction", reason }),
+				});
 				summary = compactResult.summary;
 				firstKeptEntryId = compactResult.firstKeptEntryId;
 				tokensBefore = compactResult.tokensBefore;
@@ -2237,6 +3194,15 @@ export class AgentSession {
 					fromExtension,
 				});
 				return false;
+			}
+
+			// Auto-review the summary's uncertain sections (Model Inferences /
+			// Open Questions / External State) against the latest conversation
+			// before it becomes permanent context, so settled entries no longer
+			// surface as "unverified items" for the user. Silent — a failure
+			// keeps the summary untouched and the user review flow intact.
+			if (this.settingsManager.getUncertaintyReviewAuto()) {
+				summary = await this._autoReviewSummary(summary);
 			}
 
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
@@ -2619,6 +3585,12 @@ export class AgentSession {
 		for (const tool of wrappedExtensionTools as AgentTool[]) {
 			toolRegistry.set(tool.name, tool);
 		}
+		// Post-edit scan: after a successful edit, surface references that still
+		// use identifiers the edit changed (via registered codegraph tools).
+		if (this.settingsManager.getCodeScanEnabled()) {
+			const editTool = toolRegistry.get("edit");
+			if (editTool) toolRegistry.set("edit", this._wrapWithPostEditScan(editTool));
+		}
 		this._toolRegistry = toolRegistry;
 
 		const nextActiveToolNames = (
@@ -2662,13 +3634,52 @@ export class AgentSession {
 					]),
 				)
 			: createAllToolDefinitions(this._cwd, {
-					read: { autoResizeImages },
-					bash: { commandPrefix: shellCommandPrefix, shellPath },
+					read: { autoResizeImages, tracker: this._fileContextTracker },
+					edit: { tracker: this._fileContextTracker, fileHistory: this._fileHistory },
+					write: { tracker: this._fileContextTracker, fileHistory: this._fileHistory },
+					bash: {
+						commandPrefix: shellCommandPrefix,
+						shellPath,
+						exposeProviderSecrets: this.settingsManager.getBashExposeProviderSecrets(),
+						sudo: this._localSudoHandler,
+						waitSchedule: (seconds, opts) => this._scheduleWait(seconds, opts),
+						spawnBg: async (task, label) => {
+							const bg = this._integrationManager.get<BackgroundTasksIntegration>("bg-tasks");
+							if (!bg) {
+								throw new Error("background tasks are unavailable");
+							}
+							const spawned = await bg.store.spawn(task, this._cwd, 12 * 3600 * 1000, this.sessionId, label);
+							return { id: spawned.id, logFile: spawned.logFile };
+						},
+					},
+					askUser: { askUser: this._askUserHandler },
+					wait: { schedule: (seconds) => this._scheduleWait(seconds) },
 				});
 
 		this._baseToolDefinitions = new Map(
 			Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition]),
 		);
+
+		// Core integrations (todo flow, subagent, …): rebuilt alongside extensions.
+		this._integrationManager?.onShutdown();
+		let manager: IntegrationManager;
+		manager = new IntegrationManager({
+			cwd: this._cwd,
+			sessionManager: this.sessionManager,
+			settingsManager: this.settingsManager,
+			modelRuntime: this._modelRuntime,
+			getUI: () => this._extensionUIContext,
+			getModel: () => this.model,
+			getIntegration: (id) => manager?.get(id),
+			// All integration follow-ups funnel through one debounce queue so
+			// bursts of completions (local + SSH bg tasks, monitors) merge into
+			// a single input turn instead of one turn per notification.
+			sendFollowUp: (text) => this._integrationFollowUpBatcher.push(text),
+		});
+		this._integrationManager = manager;
+		for (const definition of this._integrationManager.getToolDefinitions()) {
+			this._baseToolDefinitions.set(definition.name, definition);
+		}
 
 		const extensionsResult = this._resourceLoader.getExtensions();
 		if (options.flagValues) {
@@ -2690,14 +3701,22 @@ export class AgentSession {
 		this._bindExtensionCore(this._extensionRunner);
 		this._applyExtensionBindings(this._extensionRunner);
 
+		const integrationDefaultNames = this._integrationManager
+			.getDefaultActiveToolNames()
+			.filter(
+				(name) =>
+					!this._excludedToolNames?.has(name) && (!this._allowedToolNames || this._allowedToolNames.has(name)),
+			);
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: ["read", "bash", "edit", "write"];
+			: ["read", "bash", "edit", "write", "ask_user", "wait", ...integrationDefaultNames];
 		const baseActiveToolNames = options.activeToolNames ?? defaultActiveToolNames;
 		this._refreshToolRegistry({
 			activeToolNames: baseActiveToolNames,
 			includeAllExtensionTools: options.includeAllExtensionTools,
 		});
+
+		this._integrationManager.onSessionStart();
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
@@ -2998,7 +4017,13 @@ export class AgentSession {
 	async navigateTree(
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
-	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+	): Promise<{
+		editorText?: string;
+		cancelled: boolean;
+		aborted?: boolean;
+		summaryEntry?: BranchSummaryEntry;
+		fileRevert?: FileRevertResult;
+	}> {
 		if (this.isStreaming) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");
 		}
@@ -3138,6 +4163,16 @@ export class AgentSession {
 			// Switch leaf (with or without summary)
 			// Summary is attached at the navigation target position (newLeafId), not the old branch
 			let summaryEntry: BranchSummaryEntry | undefined;
+
+			// Revert tracked file mutations made after the navigation target so
+			// the working tree matches the rewinded transcript (/tree rewind).
+			const pathIds = new Set<string>();
+			let pathCursor: string | null = newLeafId;
+			while (pathCursor !== null) {
+				pathIds.add(pathCursor);
+				pathCursor = this.sessionManager.getEntry(pathCursor)?.parentId ?? null;
+			}
+			const fileRevert = await this._fileHistory.revertTo(pathIds, newLeafId);
 			if (summaryText) {
 				// Create summary at target position (can be null for root)
 				const summaryId = this.sessionManager.branchWithSummary(
@@ -3178,10 +4213,11 @@ export class AgentSession {
 				summaryEntry,
 				fromExtension: summaryText ? fromExtension : undefined,
 			});
+			this._integrationManager.onSessionTree();
 
 			// Emit to custom tools
 
-			return { editorText, cancelled: false, summaryEntry };
+			return { editorText, cancelled: false, summaryEntry, fileRevert };
 		} finally {
 			this._branchSummaryAbortController = undefined;
 		}
@@ -3300,6 +4336,9 @@ export class AgentSession {
 			}
 		}
 
+		// fork(pi-ex): pruning moved to the fork-context extension (context event),
+		// so this estimate no longer reflects pruned requests — it is an
+		// upper bound of what the provider sees.
 		const estimate = estimateContextTokens(this.messages);
 		const percent = (estimate.tokens / contextWindow) * 100;
 

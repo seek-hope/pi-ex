@@ -24,6 +24,10 @@ const DEFAULT_SEQUENCE_TIMEOUT_MS = 50;
 const DEFAULT_ESCAPE_TIMEOUT_MS = 10;
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
+/** Upper bound on the buffered incomplete tail (1 MiB) so a never-completing
+ * escape sequence can't grow the buffer without limit. On overflow the
+ * incomplete tail is flushed as-is (best-effort) and the cap resets. */
+const MAX_BUFFER_SIZE = 1024 * 1024;
 
 /**
  * Check if a string is a complete escape sequence or needs more data
@@ -321,6 +325,18 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 
 		this.buffer += str;
 
+		// Defensive cap: if the incomplete tail exceeds the bound, force-flush it
+		// so memory can't grow without limit (e.g. a malformed/never-terminating
+		// escape sequence). The flushed bytes are emitted best-effort.
+		if (this.buffer.length > MAX_BUFFER_SIZE) {
+			const overflowed = this.buffer;
+			this.buffer = "";
+			this.timeout = null;
+			this.pendingKittyPrintableCodepoint = undefined;
+			this.emit("data", overflowed);
+			return;
+		}
+
 		if (this.pasteMode) {
 			this.pasteBuffer += this.buffer;
 			this.buffer = "";
@@ -417,10 +433,15 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			return [];
 		}
 
-		const sequences = [this.buffer];
+		// Split complete sequences out of the buffered tail instead of dumping
+		// the whole buffer as one blob, so each complete sequence passes through
+		// emitDataSequence individually (its per-sequence dedup stays correct and
+		// adjacent identical printable sequences are neither swallowed nor
+		// re-sent in one lump). The leftover incomplete tail is emitted as-is.
+		const result = extractCompleteSequences(this.buffer);
 		this.buffer = "";
 		this.pendingKittyPrintableCodepoint = undefined;
-		return sequences;
+		return [...result.sequences, ...(result.remainder ? [result.remainder] : [])];
 	}
 
 	clear(): void {
