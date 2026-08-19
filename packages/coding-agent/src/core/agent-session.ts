@@ -121,10 +121,8 @@ import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
 import { type BuildSystemPromptOptions, buildSystemPrompt } from "./system-prompt.ts";
 import { type BashOperations, createLocalBashOperations, type LocalSudoHandler } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
-import { extractChangedIdentifiers, runPostEditScan } from "./tools/post-edit-scan.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
-import { WORK_LOOP_GUIDANCE } from "./work-loop-guidance.ts";
 
 // ============================================================================
 // Skill Block Parsing
@@ -782,44 +780,6 @@ export class AgentSession {
 		}
 	};
 
-	/**
-	 * Wrap the edit tool so successful edits are followed by a reference scan:
-	 * identifiers removed/changed by the edit are looked up via the codegraph
-	 * CLI (read-only; the daemon keeps the index fresh) and the remaining call
-	 * sites are appended to the result. Best-effort — a missing/slow/failing
-	 * scan never breaks the edit result.
-	 */
-	private _wrapWithPostEditScan(tool: AgentTool): AgentTool {
-		return {
-			...tool,
-			execute: async (toolCallId, params, signal, onUpdate) => {
-				const result = await tool.execute(toolCallId, params, signal, onUpdate);
-				if (result && this.settingsManager.getCodeScanEnabled()) {
-					const edits = (params as { edits?: Array<{ oldText?: string; newText?: string }> } | undefined)?.edits;
-					if (Array.isArray(edits) && edits.length > 0) {
-						const changed = extractChangedIdentifiers(edits);
-						if (changed.length > 0) {
-							try {
-								const scan = await runPostEditScan(changed, {
-									cwd: this._cwd,
-								});
-								if (scan) {
-									return {
-										...result,
-										content: [...(result.content ?? []), { type: "text", text: scan }],
-									};
-								}
-							} catch {
-								// The scan must never break the edit result.
-							}
-						}
-					}
-				}
-				return result;
-			},
-		};
-	}
-
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
 		const settings = this.settingsManager.getRetrySettings();
 		if (!settings.enabled || this._retryAttempt >= settings.maxRetries) {
@@ -1196,12 +1156,9 @@ export class AgentSession {
 			promptGuidelines,
 		};
 		const prompt = buildSystemPrompt(this._baseSystemPromptOptions);
-		// Teach the model the [uncertain:...] marker protocol when incremental
-		// review is active (interactive runs collect and prompt on the flags).
-		const guidance: string[] = [WORK_LOOP_GUIDANCE];
-		if (this.settingsManager.getUncertaintyReviewTiming() === "incremental") {
-		}
-		return `${prompt}\n\n${guidance.join("\n\n")}`;
+		// fork(pi-ex): the work-loop guidance + uncertainty protocol prompt are
+		// appended by the context extension (before_agent_start chaining).
+		return prompt;
 	}
 
 	// =========================================================================
@@ -2836,11 +2793,6 @@ export class AgentSession {
 			toolRegistry.set(tool.name, tool);
 		}
 		// Post-edit scan: after a successful edit, surface references that still
-		// use identifiers the edit changed (via registered codegraph tools).
-		if (this.settingsManager.getCodeScanEnabled()) {
-			const editTool = toolRegistry.get("edit");
-			if (editTool) toolRegistry.set("edit", this._wrapWithPostEditScan(editTool));
-		}
 		this._toolRegistry = toolRegistry;
 
 		const nextActiveToolNames = (
